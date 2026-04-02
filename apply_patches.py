@@ -42,7 +42,7 @@ def phab_call(method: str, args: dict, api_token: str) -> dict:
     }).encode()
 
     req = urllib.request.Request(url, data=payload, method="POST")
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read())
 
     if data.get("error_code"):
@@ -61,54 +61,73 @@ def phab_get_revisions(rev_ids: list[int], api_token: str) -> list[dict]:
     return result.get("data", [])
 
 
-def phab_get_children(phid: str, api_token: str) -> list[str]:
-    """Walk the child (successor) edge to find the full forward chain.
+def _walk_stack_edges(
+    phid: str, edge_type: str, api_token: str, logger: logging.Logger
+) -> list[str]:
+    """Walk a single-direction edge chain (parent or child) from *phid*.
 
-    Returns a list of child PHIDs in order (immediate child first).
-    Stops if the graph is non-linear.
+    Returns a list of PHIDs in traversal order (immediate neighbour first).
+    Stops and logs a warning if the graph branches (non-linear stack).
     """
-    children = []
+    result: list[str] = []
     current = phid
     while True:
         edges = phab_call("edge.search", {
             "sourcePHIDs": [current],
-            "types": ["revision.child"],
+            "types": [edge_type],
         }, api_token)
         edge_data = edges.get("data", [])
         if not edge_data:
             break
         if len(edge_data) > 1:
-            # Non-linear stack — stop here
+            logger.warning(
+                "  Non-linear stack detected at %s (%s has %d edges), "
+                "stopping walk",
+                current, edge_type, len(edge_data),
+            )
             break
-        child_phid = edge_data[0]["destinationPHID"]
-        children.append(child_phid)
-        current = child_phid
-    return children
+        next_phid = edge_data[0]["destinationPHID"]
+        result.append(next_phid)
+        current = next_phid
+    return result
 
 
 def phab_find_stack_tip(rev_id: int, api_token: str, logger: logging.Logger) -> tuple[int, list[dict]]:
-    """Given a revision ID, walk to the top of its stack.
+    """Given a revision ID, walk to the top *and* bottom of its stack.
 
     Returns (tip_rev_id, all_revisions_in_stack) where all_revisions_in_stack
-    is ordered bottom-to-top.
+    is ordered bottom-to-top (base first, tip last).
     """
     revs = phab_get_revisions([rev_id], api_token)
     if not revs:
         raise RuntimeError(f"Revision D{rev_id} not found on Phabricator")
 
     base_rev = revs[0]
-    children_phids = phab_get_children(base_rev["phid"], api_token)
 
-    if children_phids:
-        child_revs = phab_call("differential.revision.search", {
-            "constraints": {"phids": children_phids},
+    # Walk down to the stack base (parents)
+    parent_phids = _walk_stack_edges(
+        base_rev["phid"], "revision.parent", api_token, logger
+    )
+    # Walk up to the stack tip (children)
+    children_phids = _walk_stack_edges(
+        base_rev["phid"], "revision.child", api_token, logger
+    )
+
+    # Fetch full revision data for all related PHIDs
+    related_phids = parent_phids + children_phids
+    if related_phids:
+        related_revs = phab_call("differential.revision.search", {
+            "constraints": {"phids": related_phids},
+            "attachments": {"reviewers": True},
         }, api_token).get("data", [])
-        # Build a map to preserve order
-        child_map = {r["phid"]: r for r in child_revs}
-        ordered_children = [child_map[p] for p in children_phids if p in child_map]
-        all_revs = [base_rev] + ordered_children
+        related_map = {r["phid"]: r for r in related_revs}
     else:
-        all_revs = [base_rev]
+        related_map = {}
+
+    # Assemble the full stack: parents (reversed so base is first), self, children
+    parent_revs = [related_map[p] for p in reversed(parent_phids) if p in related_map]
+    child_revs = [related_map[p] for p in children_phids if p in related_map]
+    all_revs = parent_revs + [base_rev] + child_revs
 
     tip = all_revs[-1]
     tip_id = tip["id"]
@@ -148,14 +167,15 @@ def get_revisions_for_bug(
 
     Returns a list of integer revision IDs (e.g. [12345, 12346]).
     """
-    url = f"{BUGZILLA_REST_URL}/{bug_id}/attachment?api_key={bz_api_key}"
+    url = f"{BUGZILLA_REST_URL}/{bug_id}/attachment"
     logger.debug("Fetching attachments for bug %s", bug_id)
 
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/json")
+    req.add_header("X-BUGZILLA-API-KEY", bz_api_key)
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         logger.error("Failed to fetch bug %s: HTTP %s", bug_id, e.code)
@@ -238,6 +258,26 @@ def create_worktree(repo: Path, worktree: Path, logger: logging.Logger) -> None:
 # Patch application
 # ---------------------------------------------------------------------------
 
+def verify_worktree_clean(worktree: Path, logger: logging.Logger) -> bool:
+    """Return True if the worktree has no uncommitted changes or untracked files."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+    )
+    if status.returncode != 0:
+        logger.error("git status failed in %s: %s", worktree, status.stderr)
+        return False
+    if status.stdout.strip():
+        logger.error(
+            "Worktree %s is not clean, aborting patch:\n%s",
+            worktree, status.stdout.strip(),
+        )
+        return False
+    return True
+
+
 def apply_stack(
     tip_rev_id: int, worktree: Path, logger: logging.Logger
 ) -> bool:
@@ -246,6 +286,23 @@ def apply_stack(
     moz-phab will automatically fetch and apply the entire ancestor chain.
     """
     revision_str = f"D{tip_rev_id}"
+
+    # Verify clean state before applying
+    if not verify_worktree_clean(worktree, logger):
+        return False
+
+    # Record HEAD so we can reset to it on failure
+    head_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+    )
+    if head_result.returncode != 0:
+        logger.error("Failed to determine HEAD in %s", worktree)
+        return False
+    pre_patch_head = head_result.stdout.strip()
+
     logger.info("Applying stack tip %s via moz-phab in %s", revision_str, worktree)
 
     result = subprocess.run(
@@ -266,11 +323,12 @@ def apply_stack(
         )
         logger.error("stdout:\n%s", result.stdout)
         logger.error("stderr:\n%s", result.stderr)
-        # Reset any partial state so the next patch starts clean
-        subprocess.run(["git", "checkout", "."], cwd=worktree, check=False)
+        # Reset to pre-patch state (undoes partial commits and working tree changes)
+        subprocess.run(
+            ["git", "reset", "--hard", pre_patch_head],
+            cwd=worktree, check=False,
+        )
         subprocess.run(["git", "clean", "-fd"], cwd=worktree, check=False)
-        # Also reset to the branch tip in case partial commits were made
-        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=worktree, check=False)
         return False
 
     logger.debug("moz-phab stdout:\n%s", result.stdout)
@@ -309,9 +367,14 @@ def main() -> None:
         default=Path("logs"),
         help="Directory for log files (default: ./logs)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show debug output on the console (always written to log file)",
+    )
     args = parser.parse_args()
 
-    logger = setup_logging(args.log_dir)
+    logger = setup_logging(args.log_dir, debug=args.debug)
 
     # Check required env vars
     bz_api_key = os.environ.get("BUGZILLA_API_KEY")
@@ -414,14 +477,14 @@ def main() -> None:
     logger.info("=" * 60)
 
 
-def setup_logging(log_dir: Path) -> logging.Logger:
+def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
     logger = logging.getLogger("nss-patch-tool")
     logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.INFO)
+    console.setLevel(logging.DEBUG if debug else logging.INFO)
     console.setFormatter(formatter)
     logger.addHandler(console)
 
