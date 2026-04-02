@@ -3,3 +3,4 @@ logs
 nss-worktree
 nss
 lists
+__pycache__

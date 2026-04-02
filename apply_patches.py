@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -23,6 +24,8 @@ PHABRICATOR_API_URL = "https://phabricator.services.mozilla.com/api/"
 
 # Revision statuses considered "approved"
 APPROVED_STATUSES = {"accepted"}
+# Revision statuses that should be skipped entirely
+SKIP_STATUSES = {"abandoned"}
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +84,8 @@ def _walk_stack_edges(
             break
         if len(edge_data) > 1:
             logger.warning(
-                "  Non-linear stack detected at %s (%s has %d edges), "
-                "stopping walk",
-                current, edge_type, len(edge_data),
+                "⚠️  Non-linear stack at %s (%d edges), stopping walk",
+                current, len(edge_data),
             )
             break
         next_phid = edge_data[0]["destinationPHID"]
@@ -131,10 +133,10 @@ def phab_find_stack_tip(rev_id: int, api_token: str, logger: logging.Logger) -> 
 
     tip = all_revs[-1]
     tip_id = tip["id"]
-    logger.info(
-        "  D%d stack: %s (tip: D%d)",
+    logger.debug(
+        "🔗 D%d stack: %s → tip D%d",
         rev_id,
-        " -> ".join(f"D{r['id']}" for r in all_revs),
+        " → ".join(f"D{r['id']}" for r in all_revs),
         tip_id,
     )
     return tip_id, all_revs
@@ -149,11 +151,59 @@ def check_revision_statuses(
         status_name = rev["fields"]["status"].get("name", status)
         rev_id = rev["id"]
         if status not in APPROVED_STATUSES:
-            logger.warning(
-                "  Bug %s: D%d has status '%s' (not approved)", bug_id, rev_id, status_name
-            )
+            logger.warning("⚠️  D%d [%s] (not approved)", rev_id, status_name)
         else:
-            logger.info("  Bug %s: D%d status '%s'", bug_id, rev_id, status_name)
+            logger.debug("✅ D%d [%s]", rev_id, status_name)
+
+
+def phab_get_revision_paths(
+    revisions: list[dict], api_token: str, logger: logging.Logger
+) -> dict[int, set[str]]:
+    """Fetch the file paths touched by each revision via Phabricator.
+
+    Returns a mapping of revision ID -> set of file paths.
+    """
+    if not revisions:
+        return {}
+
+    rev_phids = [r["phid"] for r in revisions]
+    phid_to_id = {r["phid"]: r["id"] for r in revisions}
+
+    # Get the latest diff ID for each revision
+    diffs_result = phab_call("differential.diff.search", {
+        "constraints": {"revisionPHIDs": rev_phids},
+        "order": "newest",
+        "limit": len(rev_phids) * 5,
+    }, api_token)
+
+    rev_phid_to_diff_id: dict[str, int] = {}
+    for diff in diffs_result.get("data", []):
+        rev_phid = diff["fields"].get("revisionPHID")
+        if rev_phid and rev_phid not in rev_phid_to_diff_id:
+            rev_phid_to_diff_id[rev_phid] = diff["id"]
+
+    result: dict[int, set[str]] = {}
+    for rev_phid, diff_id in rev_phid_to_diff_id.items():
+        rev_id = phid_to_id.get(rev_phid)
+        if rev_id is None:
+            continue
+        try:
+            raw = phab_call("differential.getrawdiff", {
+                "diffID": diff_id,
+            }, api_token)
+            paths = set()
+            if isinstance(raw, str):
+                for line in raw.splitlines():
+                    m = re.match(r"^diff --git a/(.*) b/(.*)$", line)
+                    if m:
+                        paths.add(m.group(2))
+            result[rev_id] = paths
+            logger.debug("📄 D%d: %d file(s)", rev_id, len(paths))
+        except RuntimeError as e:
+            logger.warning("⚠️  Could not fetch diff for D%d: %s", rev_id, e)
+            result[rev_id] = set()
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +218,7 @@ def get_revisions_for_bug(
     Returns a list of integer revision IDs (e.g. [12345, 12346]).
     """
     url = f"{BUGZILLA_REST_URL}/{bug_id}/attachment"
-    logger.debug("Fetching attachments for bug %s", bug_id)
+    logger.debug("🔍 Bug %s attachments", bug_id)
 
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/json")
@@ -178,10 +228,10 @@ def get_revisions_for_bug(
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        logger.error("Failed to fetch bug %s: HTTP %s", bug_id, e.code)
+        logger.error("❌ Bug %s: HTTP %s", bug_id, e.code)
         return []
     except urllib.error.URLError as e:
-        logger.error("Failed to fetch bug %s: %s", bug_id, e.reason)
+        logger.error("❌ Bug %s: %s", bug_id, e.reason)
         return []
 
     rev_ids: list[int] = []
@@ -198,16 +248,15 @@ def get_revisions_for_bug(
             rev_ids.append(extracted)
         else:
             logger.warning(
-                "Bug %s: could not extract revision ID from attachment: %s",
+                "⚠️  Bug %s: can't extract rev ID from: %s",
                 bug_id,
                 attachment.get("file_name") or attachment.get("summary"),
             )
 
     if rev_ids:
-        logger.info("Bug %s: found revisions %s", bug_id,
-                     ", ".join(f"D{r}" for r in rev_ids))
+        logger.debug("🐛 Bug %s → %s", bug_id, ", ".join(f"D{r}" for r in rev_ids))
     else:
-        logger.warning("Bug %s: no Phabricator revisions found", bug_id)
+        logger.warning("⚠️  Bug %s: no revisions found", bug_id)
 
     return rev_ids
 
@@ -224,33 +273,41 @@ def _extract_revision_id(text: str) -> int | None:
 # Git / worktree helpers
 # ---------------------------------------------------------------------------
 
+def _run_git(args: list[str], logger: logging.Logger, **kwargs) -> subprocess.CompletedProcess:
+    """Run a git command, capturing output and logging it at debug level."""
+    result = subprocess.run(args, capture_output=True, text=True, **kwargs)
+    if result.stdout.strip():
+        logger.debug("%s", result.stdout.strip())
+    if result.stderr.strip():
+        logger.debug("%s", result.stderr.strip())
+    if kwargs.get("check", False) and result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, args)
+    return result
+
+
 def clone_nss(dest: Path, logger: logging.Logger) -> None:
     if (dest / ".git").exists():
-        logger.info("NSS repo already exists at %s, fetching latest", dest)
-        subprocess.run(["git", "fetch", "origin"], cwd=dest, check=True)
-        subprocess.run(["git", "checkout", "master"], cwd=dest, check=True)
-        subprocess.run(
-            ["git", "reset", "--hard", "origin/master"], cwd=dest, check=True
-        )
+        logger.debug("📦 Updating NSS at %s", dest)
+        _run_git(["git", "fetch", "origin"], logger, cwd=dest, check=True)
+        _run_git(["git", "checkout", "master"], logger, cwd=dest, check=True)
+        _run_git(["git", "reset", "--hard", "origin/master"], logger, cwd=dest, check=True)
     else:
-        logger.info("Cloning NSS from %s into %s", NSS_REPO_URL, dest)
-        subprocess.run(["git", "clone", NSS_REPO_URL, str(dest)], check=True)
+        logger.debug("📦 Cloning NSS → %s", dest)
+        _run_git(["git", "clone", NSS_REPO_URL, str(dest)], logger, check=True)
 
 
 def create_worktree(repo: Path, worktree: Path, logger: logging.Logger) -> None:
     branch_name = f"patch-apply-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if worktree.exists():
-        logger.info("Removing existing worktree at %s", worktree)
-        subprocess.run(
+        logger.debug("🌿 Removing old worktree %s", worktree)
+        _run_git(
             ["git", "worktree", "remove", "--force", str(worktree)],
-            cwd=repo,
-            check=False,
+            logger, cwd=repo,
         )
-    logger.info("Creating worktree at %s on branch %s", worktree, branch_name)
-    subprocess.run(
+    logger.debug("🌿 Worktree %s [%s]", worktree, branch_name)
+    _run_git(
         ["git", "worktree", "add", "-b", branch_name, str(worktree), "origin/master"],
-        cwd=repo,
-        check=True,
+        logger, cwd=repo, check=True,
     )
 
 
@@ -267,29 +324,94 @@ def verify_worktree_clean(worktree: Path, logger: logging.Logger) -> bool:
         text=True,
     )
     if status.returncode != 0:
-        logger.error("git status failed in %s: %s", worktree, status.stderr)
+        logger.error("❌ git status failed: %s", status.stderr)
         return False
     if status.stdout.strip():
-        logger.error(
-            "Worktree %s is not clean, aborting patch:\n%s",
-            worktree, status.stdout.strip(),
-        )
+        logger.error("❌ Worktree dirty, aborting:\n%s", status.stdout.strip())
         return False
     return True
 
 
+def get_conflict_files(worktree: Path, logger: logging.Logger) -> set[str]:
+    """Detect files with conflicts or dirty state in the worktree after a failed patch."""
+    files: set[str] = set()
+    # Unmerged paths (actual merge conflicts)
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        cwd=worktree, capture_output=True, text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        files.update(result.stdout.strip().splitlines())
+    # Any other dirty files (failed applies that left partial changes)
+    result = subprocess.run(
+        ["git", "diff", "--name-only"],
+        cwd=worktree, capture_output=True, text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        files.update(result.stdout.strip().splitlines())
+    return files
+
+
+def diagnose_conflict(
+    conflict_files: set[str],
+    stack_file_map: dict[int, set[str]],
+    applied_files: dict[str, list[tuple[str, int]]],
+    logger: logging.Logger,
+) -> None:
+    """Log diagnostic information about which revisions likely caused a conflict."""
+    # All files this stack touches
+    all_stack_files: set[str] = set()
+    for paths in stack_file_map.values():
+        all_stack_files |= paths
+
+    if conflict_files:
+        logger.error("💥 Conflicting files: %s", ", ".join(sorted(conflict_files)))
+
+    # Find files that overlap between this stack and previously applied patches
+    candidate_files: set[str] = set()
+    prior_hits: dict[tuple[str, int], list[str]] = {}
+    for f in all_stack_files:
+        for key in applied_files.get(f, []):
+            candidate_files.add(f)
+            prior_hits.setdefault(key, []).append(f)
+
+    if candidate_files:
+        logger.error(
+            "🔀 Candidate clashes with prior patches: %s",
+            ", ".join(sorted(candidate_files)),
+        )
+        # Which revisions in this stack touch the candidate files?
+        for rev_id in sorted(stack_file_map):
+            overlap = sorted(candidate_files & stack_file_map[rev_id])
+            if overlap:
+                logger.error("   D%d: %s", rev_id, ", ".join(overlap))
+        # Which prior patches touched them?
+        for (bug_id, tip_id), files in sorted(prior_hits.items()):
+            logger.error(
+                "   ↳ Bug %s (D%d): %s", bug_id, tip_id, ", ".join(sorted(files))
+            )
+    else:
+        logger.error("🌲 No overlap with prior patches — likely conflicts with base tree")
+
+
 def apply_stack(
-    tip_rev_id: int, worktree: Path, logger: logging.Logger
-) -> bool:
+    tip_rev_id: int,
+    worktree: Path,
+    logger: logging.Logger,
+    *,
+    stack_file_map: dict[int, set[str]] | None = None,
+    applied_files: dict[str, list[tuple[str, int]]] | None = None,
+) -> tuple[bool, set[str]]:
     """Apply the full stack ending at tip_rev_id using moz-phab patch.
 
     moz-phab will automatically fetch and apply the entire ancestor chain.
+    Returns (success, set_of_files_modified).
     """
     revision_str = f"D{tip_rev_id}"
 
     # Verify clean state before applying
     if not verify_worktree_clean(worktree, logger):
-        return False
+        return False, set()
 
     # Record HEAD so we can reset to it on failure
     head_result = subprocess.run(
@@ -299,11 +421,11 @@ def apply_stack(
         text=True,
     )
     if head_result.returncode != 0:
-        logger.error("Failed to determine HEAD in %s", worktree)
-        return False
+        logger.error("❌ Can't determine HEAD in %s", worktree)
+        return False, set()
     pre_patch_head = head_result.stdout.strip()
 
-    logger.info("Applying stack tip %s via moz-phab in %s", revision_str, worktree)
+    logger.debug("📎 Applying %s", revision_str)
 
     result = subprocess.run(
         [
@@ -318,24 +440,42 @@ def apply_stack(
     )
 
     if result.returncode != 0:
-        logger.error(
-            "Failed to apply %s (exit code %d)", revision_str, result.returncode
-        )
-        logger.error("stdout:\n%s", result.stdout)
-        logger.error("stderr:\n%s", result.stderr)
-        # Reset to pre-patch state (undoes partial commits and working tree changes)
+        logger.error("❌ %s failed (exit %d)", revision_str, result.returncode)
+        logger.debug("stdout:\n%s", result.stdout)
+        logger.debug("stderr:\n%s", result.stderr)
+
+        # Diagnose the conflict before resetting
+        if stack_file_map is not None:
+            conflict_files = get_conflict_files(worktree, logger)
+            diagnose_conflict(
+                conflict_files,
+                stack_file_map,
+                applied_files or {},
+                logger,
+            )
+
+        # Reset to pre-patch state
         subprocess.run(
             ["git", "reset", "--hard", pre_patch_head],
             cwd=worktree, check=False,
         )
         subprocess.run(["git", "clean", "-fd"], cwd=worktree, check=False)
-        return False
+        return False, set()
+
+    # Record which files this stack modified
+    diff_result = subprocess.run(
+        ["git", "diff", "--name-only", f"{pre_patch_head}..HEAD"],
+        cwd=worktree, capture_output=True, text=True,
+    )
+    modified_files: set[str] = set()
+    if diff_result.returncode == 0 and diff_result.stdout.strip():
+        modified_files = set(diff_result.stdout.strip().splitlines())
 
     logger.debug("moz-phab stdout:\n%s", result.stdout)
     if result.stderr:
         logger.debug("moz-phab stderr:\n%s", result.stderr)
-    logger.info("Successfully applied stack tip %s", revision_str)
-    return True
+    logger.debug("✅ %s applied (%d files)", revision_str, len(modified_files))
+    return True, modified_files
 
 
 # ---------------------------------------------------------------------------
@@ -379,18 +519,18 @@ def main() -> None:
     # Check required env vars
     bz_api_key = os.environ.get("BUGZILLA_API_KEY")
     if not bz_api_key:
-        logger.error("BUGZILLA_API_KEY environment variable is not set")
+        logger.error("❌ BUGZILLA_API_KEY not set")
         sys.exit(1)
 
     phab_api_token = os.environ.get("PHABRICATOR_API_TOKEN")
     if not phab_api_token:
-        logger.error("PHABRICATOR_API_TOKEN environment variable is not set")
+        logger.error("❌ PHABRICATOR_API_TOKEN not set")
         sys.exit(1)
 
     # Read bug numbers
     bug_file: Path = args.bug_file
     if not bug_file.exists():
-        logger.error("Bug file not found: %s", bug_file)
+        logger.error("❌ Bug file not found: %s", bug_file)
         sys.exit(1)
 
     bug_ids = [
@@ -398,7 +538,7 @@ def main() -> None:
         for line in bug_file.read_text().splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    logger.info("Loaded %d bug(s) from %s", len(bug_ids), bug_file)
+    logger.info("📋 %d bug(s) from %s", len(bug_ids), bug_file)
 
     # Clone / update NSS
     nss_dir = args.nss_dir.resolve()
@@ -412,19 +552,25 @@ def main() -> None:
     succeeded: list[tuple[str, int]] = []
     failed: list[tuple[str, int, str]] = []
     skipped_bugs: list[str] = []
+    # Track which files have been modified by successfully-applied stacks,
+    # so we can identify the source of conflicts when a later patch fails.
+    applied_files: dict[str, list[tuple[str, int]]] = {}
 
     for bug_id in bug_ids:
-        logger.info("--- Processing bug %s ---", bug_id)
+        logger.debug("── 🐛 Bug %s ──", bug_id)
 
         # Step 1: Get revision IDs from Bugzilla
         rev_ids = get_revisions_for_bug(bug_id, bz_api_key, logger)
         if not rev_ids:
             skipped_bugs.append(bug_id)
+            logger.info("⏭️  Bug %s: no revisions", bug_id)
             continue
 
         # Step 2: For each revision, find the stack tip and check statuses
         # Deduplicate tips — multiple revisions on one bug may share a stack
         tips_seen: set[int] = set()
+        bug_ok: list[int] = []
+        bug_fail: list[int] = []
 
         for rev_id in rev_ids:
             try:
@@ -432,49 +578,88 @@ def main() -> None:
                     rev_id, phab_api_token, logger
                 )
             except RuntimeError as e:
-                logger.error("  Bug %s: D%d — %s", bug_id, rev_id, e)
+                logger.error("❌ Bug %s D%d: %s", bug_id, rev_id, e)
                 failed.append((bug_id, rev_id, str(e)))
+                bug_fail.append(rev_id)
+                continue
+
+            # Skip if the entry revision itself is abandoned
+            entry_rev = next(
+                (r for r in stack_revs if r["id"] == rev_id), None
+            )
+            if entry_rev and entry_rev["fields"]["status"]["value"] in SKIP_STATUSES:
+                status_name = entry_rev["fields"]["status"].get("name", "abandoned")
+                logger.debug("🗑️  D%d [%s], skipping", rev_id, status_name)
                 continue
 
             # Check and warn about non-approved revisions in the stack
             check_revision_statuses(stack_revs, bug_id, logger)
 
             if tip_id in tips_seen:
-                logger.info(
-                    "  D%d shares stack tip D%d (already queued), skipping",
-                    rev_id, tip_id,
-                )
+                logger.debug("⏭️  D%d (tip D%d already queued)", rev_id, tip_id)
                 continue
             tips_seen.add(tip_id)
 
+            # Fetch which files each revision in the stack touches
+            stack_file_map = phab_get_revision_paths(
+                stack_revs, phab_api_token, logger
+            )
+
             # Step 3: Apply the stack via moz-phab
-            ok = apply_stack(tip_id, worktree_dir, logger)
+            ok, modified_files = apply_stack(
+                tip_id, worktree_dir, logger,
+                stack_file_map=stack_file_map,
+                applied_files=applied_files,
+            )
             if ok:
                 succeeded.append((bug_id, tip_id))
+                bug_ok.append(tip_id)
+                for f in modified_files:
+                    applied_files.setdefault(f, []).append((bug_id, tip_id))
             else:
                 failed.append((bug_id, tip_id, "moz-phab patch failed"))
+                bug_fail.append(tip_id)
+
+        # One-line per-bug summary
+        parts: list[str] = []
+        if bug_ok:
+            parts.append("✅ " + ", ".join(f"D{t}" for t in bug_ok))
+        if bug_fail:
+            parts.append("❌ " + ", ".join(f"D{t}" for t in bug_fail))
+        logger.info("🐛 Bug %s  %s", bug_id, "  ".join(parts))
 
     # Summary
-    logger.info("=" * 60)
-    logger.info("SUMMARY")
+    logger.info("═" * 50)
     logger.info(
-        "  Stacks applied: %d | Failed: %d | Bugs with no revisions: %d",
-        len(succeeded),
-        len(failed),
-        len(skipped_bugs),
+        "📊 ✅ %d applied · ❌ %d failed · ⏭️  %d skipped",
+        len(succeeded), len(failed), len(skipped_bugs),
     )
-    if succeeded:
-        logger.info("  Succeeded:")
-        for bug_id, tip_id in succeeded:
-            logger.info("    Bug %s: stack tip D%d", bug_id, tip_id)
-    if failed:
-        logger.info("  Failed:")
-        for bug_id, rev_id, reason in failed:
-            logger.info("    Bug %s: D%d — %s", bug_id, rev_id, reason)
+    for bug_id, tip_id in succeeded:
+        logger.info("   ✅ Bug %s → D%d", bug_id, tip_id)
+    for bug_id, rev_id, reason in failed:
+        logger.info("   ❌ Bug %s → D%d: %s", bug_id, rev_id, reason)
     if skipped_bugs:
-        logger.info("  Skipped (no revisions): %s", ", ".join(skipped_bugs))
-    logger.info("  Worktree: %s", worktree_dir)
-    logger.info("=" * 60)
+        logger.info("   ⏭️  No revisions: %s", ", ".join(skipped_bugs))
+    logger.info("📂 Worktree: %s", worktree_dir)
+    logger.info("═" * 50)
+
+
+class _ColorFormatter(logging.Formatter):
+    """Logging formatter that adds ANSI colour to the level name."""
+
+    COLORS = {
+        logging.DEBUG: "\033[36m",     # cyan
+        logging.INFO: "\033[32m",      # green
+        logging.WARNING: "\033[33m",   # yellow
+        logging.ERROR: "\033[31m",     # red
+        logging.CRITICAL: "\033[1;31m",  # bold red
+    }
+    RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self.COLORS.get(record.levelno, "")
+        record.levelname = f"{color}{record.levelname}{self.RESET}"
+        return super().format(record)
 
 
 def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
@@ -485,7 +670,10 @@ def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
 
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG if debug else logging.INFO)
-    console.setFormatter(formatter)
+    if sys.stdout.isatty():
+        console.setFormatter(_ColorFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+    else:
+        console.setFormatter(formatter)
     logger.addHandler(console)
 
     log_dir.mkdir(parents=True, exist_ok=True)
