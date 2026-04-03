@@ -6,14 +6,17 @@ creates a single worktree, and applies each stack via moz-phab patch.
 """
 
 import argparse
+import hashlib
 import http.client
 import json
 import logging
 import os
 import re
+import sqlite3
 import ssl
 import subprocess
 import sys
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -27,61 +30,127 @@ APPROVED_STATUSES = {"accepted"}
 # Revision statuses that should be skipped entirely
 SKIP_STATUSES = {"abandoned"}
 
+DEFAULT_CACHE_DB = Path(".cache/lookups.db")
+DEFAULT_CACHE_TTL = 3600  # 1 hour
+
 
 # ---------------------------------------------------------------------------
 # Persistent HTTP connection pool (stdlib only)
 # ---------------------------------------------------------------------------
 
 class _ConnectionPool:
-    """Reuses HTTP(S) connections per (host, port) pair."""
+    """Reuses HTTP(S) connections per (host, port) pair with optional disk cache."""
 
-    def __init__(self, timeout: int = 30):
+    def __init__(self, timeout: int = 30,
+                 cache_db: Path | None = DEFAULT_CACHE_DB,
+                 cache_ttl: int = DEFAULT_CACHE_TTL):
         self._timeout = timeout
         self._conns: dict[tuple[str, int], http.client.HTTPSConnection] = {}
+        self._db: sqlite3.Connection | None = None
+        self._cache_ttl = cache_ttl
+        self.cache_hits = 0
+        self.cache_misses = 0
+        if cache_db is not None:
+            cache_db.parent.mkdir(parents=True, exist_ok=True)
+            self._db = sqlite3.connect(str(cache_db))
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS cache "
+                "(key TEXT PRIMARY KEY, body BLOB, ts REAL)"
+            )
+            self._db.execute(
+                "DELETE FROM cache WHERE ts < ?",
+                (time.time() - cache_ttl,),
+            )
+            self._db.commit()
+
+    @staticmethod
+    def _cache_key(url: str, data: bytes | None) -> str:
+        raw = url.encode() + b"\0" + (data or b"")
+        return hashlib.sha256(raw).hexdigest()
+
+    def _cache_get(self, key: str) -> bytes | None:
+        if self._db is None:
+            return None
+        row = self._db.execute(
+            "SELECT body FROM cache WHERE key = ? AND ts >= ?",
+            (key, time.time() - self._cache_ttl),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _cache_put(self, key: str, body: bytes) -> None:
+        if self._db is None:
+            return
+        self._db.execute(
+            "INSERT OR REPLACE INTO cache (key, body, ts) VALUES (?, ?, ?)",
+            (key, body, time.time()),
+        )
+        self._db.commit()
 
     def urlopen(self, url: str, data: bytes | None = None,
                 headers: dict[str, str] | None = None,
                 method: str = "POST") -> bytes:
+        cache_key = self._cache_key(url, data)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            self.cache_hits += 1
+            return cached
+        self.cache_misses += 1
+
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname
         port = parsed.port or 443
         key = (host, port)
-
-        conn = self._conns.get(key)
-        if conn is None:
-            ctx = ssl.create_default_context()
-            conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
-                                               context=ctx)
-            self._conns[key] = conn
 
         path = parsed.path
         if parsed.query:
             path = f"{path}?{parsed.query}"
 
         hdrs = headers or {}
-        try:
-            conn.request(method, path, body=data, headers=hdrs)
-            resp = conn.getresponse()
-        except (http.client.RemoteDisconnected, ConnectionError, OSError):
-            # Server closed the keep-alive connection; reconnect once.
-            ctx = ssl.create_default_context()
-            conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
-                                               context=ctx)
-            self._conns[key] = conn
-            conn.request(method, path, body=data, headers=hdrs)
-            resp = conn.getresponse()
 
-        body = resp.read()
-        if resp.status >= 400:
-            raise http.client.HTTPException(
-                f"HTTP {resp.status} {resp.reason} for {url}"
-            )
-        return body
+        while True:
+            conn = self._conns.get(key)
+            if conn is None:
+                ctx = ssl.create_default_context()
+                conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
+                                                   context=ctx)
+                self._conns[key] = conn
+
+            try:
+                conn.request(method, path, body=data, headers=hdrs)
+                resp = conn.getresponse()
+            except (http.client.RemoteDisconnected, ConnectionError, OSError):
+                # Server closed the keep-alive connection; reconnect once.
+                ctx = ssl.create_default_context()
+                conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
+                                                   context=ctx)
+                self._conns[key] = conn
+                conn.request(method, path, body=data, headers=hdrs)
+                resp = conn.getresponse()
+
+            body = resp.read()
+
+            if resp.status == 429:
+                delay = int(resp.getheader("Retry-After", "5"))
+                logging.getLogger("nss-patch-tool").warning(
+                    "⏳ Rate-limited by %s, retrying in %ds", host, delay,
+                )
+                time.sleep(delay)
+                continue
+
+            if resp.status >= 400:
+                raise http.client.HTTPException(
+                    f"HTTP {resp.status} {resp.reason} for {url}"
+                )
+
+            self._cache_put(cache_key, body)
+            return body
 
     def close(self) -> None:
         for conn in self._conns.values():
             conn.close()
         self._conns.clear()
+        if self._db is not None:
+            self._db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +427,20 @@ def clone_nss(dest: Path, logger: logging.Logger) -> None:
         _run_git(["git", "clone", NSS_REPO_URL, str(dest)], logger, check=True)
 
 
+def _cleanup_old_branches(repo: Path, logger: logging.Logger) -> None:
+    """Delete any leftover patch-apply-* branches from previous runs."""
+    result = _run_git(
+        ["git", "branch", "--list", "patch-apply-*"],
+        logger, cwd=repo,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return
+    for line in result.stdout.strip().splitlines():
+        branch = line.strip().lstrip("* ")
+        logger.debug("🧹 Deleting old branch %s", branch)
+        _run_git(["git", "branch", "-D", branch], logger, cwd=repo)
+
+
 def create_worktree(repo: Path, worktree: Path, logger: logging.Logger) -> None:
     branch_name = f"patch-apply-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if worktree.exists():
@@ -366,6 +449,7 @@ def create_worktree(repo: Path, worktree: Path, logger: logging.Logger) -> None:
             ["git", "worktree", "remove", "--force", str(worktree)],
             logger, cwd=repo,
         )
+    _cleanup_old_branches(repo, logger)
     logger.debug("🌿 Worktree %s [%s]", worktree, branch_name)
     _run_git(
         ["git", "worktree", "add", "-b", branch_name, str(worktree), "origin/master"],
@@ -574,6 +658,17 @@ def main() -> None:
         action="store_true",
         help="Show debug output on the console (always written to log file)",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable the persistent lookup cache",
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        default=DEFAULT_CACHE_TTL,
+        help=f"Cache TTL in seconds (default: {DEFAULT_CACHE_TTL})",
+    )
     args = parser.parse_args()
 
     logger = setup_logging(args.log_dir, debug=args.debug)
@@ -618,12 +713,20 @@ def main() -> None:
     # so we can identify the source of conflicts when a later patch fails.
     applied_files: dict[str, list[tuple[str, int]]] = {}
 
-    pool = _ConnectionPool()
+    pool = _ConnectionPool(
+        cache_db=None if args.no_cache else DEFAULT_CACHE_DB,
+        cache_ttl=args.cache_ttl,
+    )
     try:
         _main_loop(bug_ids, bz_api_key, phab_api_token, pool, worktree_dir, logger,
                    succeeded, failed, skipped_bugs, applied_files)
     finally:
         pool.close()
+
+    logger.info(
+        "🗄️  Cache: %d hits / %d misses",
+        pool.cache_hits, pool.cache_misses,
+    )
 
     # Summary
     logger.info(

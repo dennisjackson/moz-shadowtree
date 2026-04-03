@@ -4,3 +4,4 @@ nss-worktree
 nss
 lists
 __pycache__
+.cache
