@@ -24,7 +24,7 @@ def parse_bug_file(bug_file: Path) -> BugFileConfig:
         if not stripped:
             continue
         if stripped.startswith("#"):
-            comment = stripped.lstrip("# ").strip()
+            comment = stripped.lstrip("#").strip()
             key, _, value = comment.partition(":")
             if key.lower() in {"repo", "branch", "tag", "name"} and value:
                 directives[key.lower()] = value.strip()

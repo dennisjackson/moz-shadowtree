@@ -39,7 +39,11 @@ def clone_repo(dest: Path, repo_url: str, branch: str, logger: logging.Logger,
             _run_git(["git", "reset", "--hard", f"origin/{branch}"], logger, cwd=dest, check=True)
     else:
         logger.debug("\U0001f4e6 Cloning %s \u2192 %s", repo_url, dest)
+        ref = tag or branch
         _run_git(["git", "clone", repo_url, str(dest)], logger, check=True)
+        _run_git(["git", "checkout", ref], logger, cwd=dest, check=True)
+        if not tag:
+            _run_git(["git", "reset", "--hard", f"origin/{branch}"], logger, cwd=dest, check=True)
 
 
 def _cleanup_old_branches(repo: Path, logger: logging.Logger) -> None:
@@ -51,7 +55,7 @@ def _cleanup_old_branches(repo: Path, logger: logging.Logger) -> None:
 
 def create_worktree(repo: Path, worktree: Path, branch: str, logger: logging.Logger,
                     *, tag: str | None = None) -> None:
-    branch_name = f"patch-apply-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    branch_name = f"patch-apply-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     start_point = tag if tag else f"origin/{branch}"
     if worktree.exists():
         logger.debug("\U0001f33f Removing old worktree %s", worktree)

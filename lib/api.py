@@ -127,9 +127,10 @@ class PhabClient:
             if not edge_data:
                 break
             if len(edge_data) > 1:
+                dest_phids = [e["destinationPHID"] for e in edge_data]
                 self.logger.warning(
-                    "\u26a0\ufe0f  Non-linear stack at %s (%d edges), stopping walk",
-                    current, len(edge_data),
+                    "\u26a0\ufe0f  Non-linear stack at %s (%d %s edges: %s), stopping walk",
+                    current, len(edge_data), edge_type, ", ".join(dest_phids),
                 )
                 break
             next_phid = edge_data[0]["destinationPHID"]
@@ -191,14 +192,26 @@ class PhabClient:
         rev_phids = [r["phid"] for r in revisions]
         phid_to_id = {r["phid"]: r["id"] for r in revisions}
 
-        diffs_result = self.call("differential.diff.search", {
-            "constraints": {"revisionPHIDs": rev_phids},
-            "order": "newest",
-            "limit": len(rev_phids) * 5,
-        })
+        all_diffs: list[dict] = []
+        after = None
+        limit = len(rev_phids) * 5
+        while True:
+            query: dict = {
+                "constraints": {"revisionPHIDs": rev_phids},
+                "order": "newest",
+                "limit": limit,
+            }
+            if after is not None:
+                query["after"] = after
+            diffs_result = self.call("differential.diff.search", query)
+            all_diffs.extend(diffs_result.get("data", []))
+            cursor = diffs_result.get("cursor", {})
+            after = cursor.get("after")
+            if not after:
+                break
 
         rev_phid_to_diff_id: dict[str, int] = {}
-        for diff in diffs_result.get("data", []):
+        for diff in all_diffs:
             rev_phid = diff["fields"].get("revisionPHID")
             if rev_phid and rev_phid not in rev_phid_to_diff_id:
                 rev_phid_to_diff_id[rev_phid] = diff["id"]
@@ -225,7 +238,7 @@ class PhabClient:
 # ---------------------------------------------------------------------------
 
 def _extract_revision_id(text: str) -> int | None:
-    m = re.search(r"D(\d+)", text)
+    m = re.search(r"\bD(\d+)\b", text)
     return int(m.group(1)) if m else None
 
 
@@ -261,6 +274,8 @@ def get_revisions_for_bug(
                 bug_id,
                 attachment.get("file_name") or attachment.get("summary"),
             )
+
+    rev_ids = list(dict.fromkeys(rev_ids))
 
     if rev_ids:
         logger.debug("\U0001f41b Bug %s \u2192 %s", bug_id, ", ".join(f"D{r}" for r in rev_ids))
