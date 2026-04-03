@@ -22,7 +22,6 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_REPO_URL = "https://github.com/nss-dev/nss.git"
 DEFAULT_BRANCH = "master"
 BUGZILLA_REST_URL = "https://bugzilla.mozilla.org/rest/bug"
 PHABRICATOR_API_URL = "https://phabricator.services.mozilla.com/api/"
@@ -133,7 +132,7 @@ class _ConnectionPool:
 
             if resp.status == 429:
                 delay = int(resp.getheader("Retry-After", "5"))
-                logging.getLogger("patch-tool").warning(
+                logging.getLogger("shadowtree").warning(
                     "⏳ Rate-limited by %s, retrying in %ds", host, delay,
                 )
                 time.sleep(delay)
@@ -640,15 +639,17 @@ def apply_stack(
 # Main
 # ---------------------------------------------------------------------------
 
-def parse_bug_file(bug_file: Path) -> tuple[str, str, str | None, list[str]]:
-    """Parse a bug list file, extracting optional repo/branch/tag directives.
+def parse_bug_file(bug_file: Path) -> tuple[str, str, str | None, str, list[str]]:
+    """Parse a bug list file, extracting optional repo/branch/tag/name directives.
 
     Supports directives as comments:
+        # name: nss-sec-high
         # repo: https://github.com/nss-dev/nss.git
         # branch: main
         # tag: NSS_3_99_RTM
     """
-    repo_url = DEFAULT_REPO_URL
+    repo_url: str | None = None
+    name: str | None = None
     branch = DEFAULT_BRANCH
     tag: str | None = None
     branch_set = False
@@ -667,13 +668,19 @@ def parse_bug_file(bug_file: Path) -> tuple[str, str, str | None, list[str]]:
                 branch_set = True
             elif comment.lower().startswith("tag:"):
                 tag = comment.split(":", 1)[1].strip()
+            elif comment.lower().startswith("name:"):
+                name = comment.split(":", 1)[1].strip()
         else:
             bug_ids.append(stripped)
 
     if tag and branch_set:
         raise ValueError("Bug file specifies both 'branch' and 'tag' — use one or the other")
+    if repo_url is None:
+        raise ValueError("Bug file must include a '# repo: <url>' directive")
+    if name is None:
+        name = bug_file.stem
 
-    return repo_url, branch, tag, bug_ids
+    return repo_url, branch, tag, name, bug_ids
 
 
 def main() -> None:
@@ -684,22 +691,10 @@ def main() -> None:
         "bug_file", type=Path, help="File with one bug number per line"
     )
     parser.add_argument(
-        "--repo-dir",
+        "--out-dir",
         type=Path,
-        default=Path("repo"),
-        help="Directory to clone the repo into (default: ./repo)",
-    )
-    parser.add_argument(
-        "--worktree-dir",
-        type=Path,
-        default=Path("nss-worktree"),
-        help="Directory for the git worktree (default: ./nss-worktree)",
-    )
-    parser.add_argument(
-        "--log-dir",
-        type=Path,
-        default=Path("logs"),
-        help="Directory for log files (default: ./logs)",
+        default=Path("out"),
+        help="Output directory for repo and worktrees (default: ./out)",
     )
     parser.add_argument(
         "--debug",
@@ -719,38 +714,54 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logger = setup_logging(args.log_dir, debug=args.debug)
+    log_dir = args.out_dir / "logs"
 
-    # Check required env vars
+    logger = setup_logging(log_dir, debug=args.debug)
+
+    # Preflight checks
+    ok = True
+
+    if not shutil.which("moz-phab"):
+        logger.error("❌ moz-phab not found on PATH")
+        ok = False
+
+    if not shutil.which("git"):
+        logger.error("❌ git not found on PATH")
+        ok = False
+
     bz_api_key = os.environ.get("BUGZILLA_API_KEY")
     if not bz_api_key:
         logger.error("❌ BUGZILLA_API_KEY not set")
-        sys.exit(1)
+        ok = False
 
     phab_api_token = os.environ.get("PHABRICATOR_API_TOKEN")
     if not phab_api_token:
         logger.error("❌ PHABRICATOR_API_TOKEN not set")
-        sys.exit(1)
+        ok = False
 
-    # Read bug numbers
     bug_file: Path = args.bug_file
     if not bug_file.exists():
         logger.error("❌ Bug file not found: %s", bug_file)
+        ok = False
+
+    if not ok:
         sys.exit(1)
 
-    repo_url, branch, tag, bug_ids = parse_bug_file(bug_file)
-    logger.info("📋 %d bug(s) from %s", len(bug_ids), bug_file)
+    repo_url, branch, tag, name, bug_ids = parse_bug_file(bug_file)
+    logger.info("📋 %d bug(s) from %s (name: %s)", len(bug_ids), bug_file, name)
     if tag:
         logger.info("🔗 Repo: %s  Tag: %s", repo_url, tag)
     else:
         logger.info("🔗 Repo: %s  Branch: %s", repo_url, branch)
 
     # Clone / update repo
-    repo_dir = args.repo_dir.resolve()
+    out_dir = args.out_dir.resolve()
+    repo_name = repo_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    repo_dir = out_dir / repo_name
     clone_repo(repo_dir, repo_url, branch, logger, tag=tag)
 
     # Create a single worktree
-    worktree_dir = args.worktree_dir.resolve()
+    worktree_dir = out_dir / name
     create_worktree(repo_dir, worktree_dir, branch, logger, tag=tag)
 
     # For each bug: find revisions, resolve stacks, check statuses, apply
@@ -900,7 +911,7 @@ class _ColorFormatter(logging.Formatter):
 
 
 def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
-    logger = logging.getLogger("patch-tool")
+    logger = logging.getLogger("shadowtree")
     logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -915,7 +926,7 @@ def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
 
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fh = logging.FileHandler(log_dir / f"apply_patches_{timestamp}.log")
+    fh = logging.FileHandler(log_dir / f"shadowtree_{timestamp}.log")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
     logger.addHandler(fh)

@@ -1,7 +1,5 @@
 .envrc
-logs
-worktree
-repo
+out
 lists
 __pycache__
 .cache
