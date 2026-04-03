@@ -6,23 +6,25 @@ creates a single worktree, and applies each stack via moz-phab patch.
 """
 
 import argparse
-import hashlib
-import http.client
+import dataclasses
 import json
 import logging
 import os
 import re
 import shutil
-import sqlite3
-import ssl
 import subprocess
 import sys
 import time
-import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_BRANCH = "master"
+import requests
+import requests_cache
+from requests.adapters import HTTPAdapter
+from rich.logging import RichHandler
+from urllib3.util.retry import Retry
+
+DEFAULT_BRANCH = "main"
 BUGZILLA_REST_URL = "https://bugzilla.mozilla.org/rest/bug"
 PHABRICATOR_API_URL = "https://phabricator.services.mozilla.com/api/"
 
@@ -31,168 +33,83 @@ APPROVED_STATUSES = {"accepted"}
 # Revision statuses that should be skipped entirely
 SKIP_STATUSES = {"abandoned"}
 
-DEFAULT_CACHE_DB = Path(".cache/lookups.db")
+DEFAULT_CACHE_DB = ".cache/lookups"
 DEFAULT_CACHE_TTL = 3600  # 1 hour
 
 
 # ---------------------------------------------------------------------------
-# Persistent HTTP connection pool (stdlib only)
+# HTTP session factory
 # ---------------------------------------------------------------------------
 
-class _ConnectionPool:
-    """Reuses HTTP(S) connections per (host, port) pair with optional disk cache."""
-
-    def __init__(self, timeout: int = 30,
-                 cache_db: Path | None = DEFAULT_CACHE_DB,
-                 cache_ttl: int = DEFAULT_CACHE_TTL):
-        self._timeout = timeout
-        self._conns: dict[tuple[str, int], http.client.HTTPSConnection] = {}
-        self._db: sqlite3.Connection | None = None
-        self._cache_ttl = cache_ttl
-        self.cache_hits = 0
-        self.cache_misses = 0
-        if cache_db is not None:
-            cache_db.parent.mkdir(parents=True, exist_ok=True)
-            self._db = sqlite3.connect(str(cache_db))
-            self._db.execute(
-                "CREATE TABLE IF NOT EXISTS cache "
-                "(key TEXT PRIMARY KEY, body BLOB, ts REAL)"
-            )
-            self._db.execute(
-                "DELETE FROM cache WHERE ts < ?",
-                (time.time() - cache_ttl,),
-            )
-            self._db.commit()
-
-    @staticmethod
-    def _cache_key(url: str, data: bytes | None) -> str:
-        raw = url.encode() + b"\0" + (data or b"")
-        return hashlib.sha256(raw).hexdigest()
-
-    def _cache_get(self, key: str) -> bytes | None:
-        if self._db is None:
-            return None
-        row = self._db.execute(
-            "SELECT body FROM cache WHERE key = ? AND ts >= ?",
-            (key, time.time() - self._cache_ttl),
-        ).fetchone()
-        return row[0] if row else None
-
-    def _cache_put(self, key: str, body: bytes) -> None:
-        if self._db is None:
-            return
-        self._db.execute(
-            "INSERT OR REPLACE INTO cache (key, body, ts) VALUES (?, ?, ?)",
-            (key, body, time.time()),
+def create_session(
+    *, cache_db: str | None = DEFAULT_CACHE_DB, cache_ttl: int = DEFAULT_CACHE_TTL
+) -> requests.Session:
+    """Create an HTTP session with connection pooling, retry, and optional disk cache."""
+    if cache_db:
+        Path(cache_db).parent.mkdir(parents=True, exist_ok=True)
+        session = requests_cache.CachedSession(
+            cache_db, backend="sqlite", expire_after=cache_ttl,
+            allowable_methods=("GET", "POST"),
         )
-        self._db.commit()
+    else:
+        session = requests.Session()
 
-    def urlopen(self, url: str, data: bytes | None = None,
-                headers: dict[str, str] | None = None,
-                method: str = "POST") -> bytes:
-        cache_key = self._cache_key(url, data)
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            self.cache_hits += 1
-            return cached
-        self.cache_misses += 1
+    retry = Retry(total=3, status_forcelist=[429],
+                  respect_retry_after_header=True, backoff_factor=1)
+    session.mount("https://", HTTPAdapter(max_retries=retry))
 
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname
-        port = parsed.port or 443
-        key = (host, port)
+    session.cache_hits = 0
+    session.cache_misses = 0
 
-        path = parsed.path
-        if parsed.query:
-            path = f"{path}?{parsed.query}"
+    def _track_cache(response, *args, **kwargs):
+        if getattr(response, "from_cache", False):
+            session.cache_hits += 1
+        else:
+            session.cache_misses += 1
+        return response
 
-        hdrs = headers or {}
-
-        while True:
-            conn = self._conns.get(key)
-            if conn is None:
-                ctx = ssl.create_default_context()
-                conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
-                                                   context=ctx)
-                self._conns[key] = conn
-
-            try:
-                conn.request(method, path, body=data, headers=hdrs)
-                resp = conn.getresponse()
-            except (http.client.RemoteDisconnected, ConnectionError, OSError):
-                # Server closed the keep-alive connection; reconnect once.
-                ctx = ssl.create_default_context()
-                conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
-                                                   context=ctx)
-                self._conns[key] = conn
-                conn.request(method, path, body=data, headers=hdrs)
-                resp = conn.getresponse()
-
-            body = resp.read()
-
-            if resp.status == 429:
-                delay = int(resp.getheader("Retry-After", "5"))
-                logging.getLogger("shadowtree").warning(
-                    "⏳ Rate-limited by %s, retrying in %ds", host, delay,
-                )
-                time.sleep(delay)
-                continue
-
-            if resp.status >= 400:
-                raise http.client.HTTPException(
-                    f"HTTP {resp.status} {resp.reason} for {url}"
-                )
-
-            self._cache_put(cache_key, body)
-            return body
-
-    def close(self) -> None:
-        for conn in self._conns.values():
-            conn.close()
-        self._conns.clear()
-        if self._db is not None:
-            self._db.close()
+    session.hooks["response"].append(_track_cache)
+    return session
 
 
 # ---------------------------------------------------------------------------
 # Phabricator Conduit helpers
 # ---------------------------------------------------------------------------
 
-def phab_call(method: str, args: dict, api_token: str, pool: _ConnectionPool) -> dict:
+def phab_call(method: str, args: dict, api_token: str, session: requests.Session) -> dict:
     """Call a Phabricator Conduit API method and return the result."""
-    url = urllib.parse.urljoin(PHABRICATOR_API_URL, method)
-    payload = urllib.parse.urlencode({
+    url = PHABRICATOR_API_URL + method
+    data = {
         "params": json.dumps(
             {**args, "__conduit__": {"token": api_token}},
             separators=(",", ":"),
         ),
         "output": "json",
         "__conduit__": True,
-    }).encode()
+    }
 
-    body = pool.urlopen(url, data=payload, headers={
-        "Content-Type": "application/x-www-form-urlencoded",
-    })
-    data = json.loads(body)
+    resp = session.post(url, data=data)
+    resp.raise_for_status()
+    result = resp.json()
 
-    if data.get("error_code"):
+    if result.get("error_code"):
         raise RuntimeError(
-            f"Phabricator error: {data.get('error_info', data['error_code'])}"
+            f"Phabricator error: {result.get('error_info', result['error_code'])}"
         )
-    return data["result"]
+    return result["result"]
 
 
-def phab_get_revisions(rev_ids: list[int], api_token: str, pool: _ConnectionPool) -> list[dict]:
+def phab_get_revisions(rev_ids: list[int], api_token: str, session: requests.Session) -> list[dict]:
     """Fetch revision metadata (including status) for a list of integer IDs."""
     result = phab_call("differential.revision.search", {
         "constraints": {"ids": rev_ids},
         "attachments": {"reviewers": True},
-    }, api_token, pool)
+    }, api_token, session)
     return result.get("data", [])
 
 
 def _walk_stack_edges(
-    phid: str, edge_type: str, api_token: str, pool: _ConnectionPool, logger: logging.Logger
+    phid: str, edge_type: str, api_token: str, session: requests.Session, logger: logging.Logger
 ) -> list[str]:
     """Walk a single-direction edge chain (parent or child) from *phid*.
 
@@ -205,7 +122,7 @@ def _walk_stack_edges(
         edges = phab_call("edge.search", {
             "sourcePHIDs": [current],
             "types": [edge_type],
-        }, api_token, pool)
+        }, api_token, session)
         edge_data = edges.get("data", [])
         if not edge_data:
             break
@@ -221,13 +138,13 @@ def _walk_stack_edges(
     return result
 
 
-def phab_find_stack_tip(rev_id: int, api_token: str, pool: _ConnectionPool, logger: logging.Logger) -> tuple[int, list[dict]]:
+def phab_find_stack_tip(rev_id: int, api_token: str, session: requests.Session, logger: logging.Logger) -> tuple[int, list[dict]]:
     """Given a revision ID, walk to the top *and* bottom of its stack.
 
     Returns (tip_rev_id, all_revisions_in_stack) where all_revisions_in_stack
     is ordered bottom-to-top (base first, tip last).
     """
-    revs = phab_get_revisions([rev_id], api_token, pool)
+    revs = phab_get_revisions([rev_id], api_token, session)
     if not revs:
         raise RuntimeError(f"Revision D{rev_id} not found on Phabricator")
 
@@ -235,11 +152,11 @@ def phab_find_stack_tip(rev_id: int, api_token: str, pool: _ConnectionPool, logg
 
     # Walk down to the stack base (parents)
     parent_phids = _walk_stack_edges(
-        base_rev["phid"], "revision.parent", api_token, pool, logger
+        base_rev["phid"], "revision.parent", api_token, session, logger
     )
     # Walk up to the stack tip (children)
     children_phids = _walk_stack_edges(
-        base_rev["phid"], "revision.child", api_token, pool, logger
+        base_rev["phid"], "revision.child", api_token, session, logger
     )
 
     # Fetch full revision data for all related PHIDs
@@ -248,7 +165,7 @@ def phab_find_stack_tip(rev_id: int, api_token: str, pool: _ConnectionPool, logg
         related_revs = phab_call("differential.revision.search", {
             "constraints": {"phids": related_phids},
             "attachments": {"reviewers": True},
-        }, api_token, pool).get("data", [])
+        }, api_token, session).get("data", [])
         related_map = {r["phid"]: r for r in related_revs}
     else:
         related_map = {}
@@ -293,7 +210,7 @@ def get_revision_status_emojis(
 
 
 def phab_get_revision_paths(
-    revisions: list[dict], api_token: str, pool: _ConnectionPool, logger: logging.Logger
+    revisions: list[dict], api_token: str, session: requests.Session, logger: logging.Logger
 ) -> dict[int, set[str]]:
     """Fetch the file paths touched by each revision via Phabricator.
 
@@ -310,7 +227,7 @@ def phab_get_revision_paths(
         "constraints": {"revisionPHIDs": rev_phids},
         "order": "newest",
         "limit": len(rev_phids) * 5,
-    }, api_token, pool)
+    }, api_token, session)
 
     rev_phid_to_diff_id: dict[str, int] = {}
     for diff in diffs_result.get("data", []):
@@ -326,7 +243,7 @@ def phab_get_revision_paths(
         try:
             raw = phab_call("differential.getrawdiff", {
                 "diffID": diff_id,
-            }, api_token, pool)
+            }, api_token, session)
             paths = set()
             if isinstance(raw, str):
                 for line in raw.splitlines():
@@ -347,7 +264,7 @@ def phab_get_revision_paths(
 # ---------------------------------------------------------------------------
 
 def get_revisions_for_bug(
-    bug_id: str, bz_api_key: str, pool: _ConnectionPool, logger: logging.Logger
+    bug_id: str, bz_api_key: str, session: requests.Session, logger: logging.Logger
 ) -> list[int]:
     """Query Bugzilla for Phabricator revision attachments on a bug.
 
@@ -357,12 +274,13 @@ def get_revisions_for_bug(
     logger.debug("🔍 Bug %s attachments", bug_id)
 
     try:
-        raw = pool.urlopen(url, method="GET", headers={
+        resp = session.get(url, headers={
             "Accept": "application/json",
             "X-BUGZILLA-API-KEY": bz_api_key,
         })
-        data = json.loads(raw)
-    except (http.client.HTTPException, ConnectionError, OSError) as e:
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
         logger.error("❌ Bug %s: %s", bug_id, e)
         return []
 
@@ -407,19 +325,19 @@ def _extract_revision_id(text: str) -> int | None:
 
 def _run_git(args: list[str], logger: logging.Logger, **kwargs) -> subprocess.CompletedProcess:
     """Run a git command, capturing output and logging it at debug level."""
+    check = kwargs.pop("check", False)
     result = subprocess.run(args, capture_output=True, text=True, **kwargs)
     if result.stdout.strip():
         logger.debug("%s", result.stdout.strip())
     if result.stderr.strip():
         logger.debug("%s", result.stderr.strip())
-    if kwargs.get("check", False) and result.returncode != 0:
+    if check and result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, args)
     return result
 
 
 def clone_repo(dest: Path, repo_url: str, branch: str, logger: logging.Logger,
                *, tag: str | None = None) -> None:
-    ref = tag or branch
     if (dest / ".git").exists():
         logger.debug("📦 Updating repo at %s", dest)
         _run_git(["git", "fetch", "origin"], logger, cwd=dest, check=True)
@@ -474,17 +392,12 @@ def create_worktree(repo: Path, worktree: Path, branch: str, logger: logging.Log
 
 def verify_worktree_clean(worktree: Path, logger: logging.Logger) -> bool:
     """Return True if the worktree has no uncommitted changes or untracked files."""
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-    )
-    if status.returncode != 0:
-        logger.error("❌ git status failed: %s", status.stderr)
+    result = _run_git(["git", "status", "--porcelain"], logger, cwd=worktree)
+    if result.returncode != 0:
+        logger.error("❌ git status failed: %s", result.stderr)
         return False
-    if status.stdout.strip():
-        logger.error("❌ Worktree dirty, aborting:\n%s", status.stdout.strip())
+    if result.stdout.strip():
+        logger.error("❌ Worktree dirty, aborting:\n%s", result.stdout.strip())
         return False
     return True
 
@@ -492,20 +405,13 @@ def verify_worktree_clean(worktree: Path, logger: logging.Logger) -> bool:
 def get_conflict_files(worktree: Path, logger: logging.Logger) -> set[str]:
     """Detect files with conflicts or dirty state in the worktree after a failed patch."""
     files: set[str] = set()
-    # Unmerged paths (actual merge conflicts)
-    result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=U"],
-        cwd=worktree, capture_output=True, text=True,
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        files.update(result.stdout.strip().splitlines())
-    # Any other dirty files (failed applies that left partial changes)
-    result = subprocess.run(
-        ["git", "diff", "--name-only"],
-        cwd=worktree, capture_output=True, text=True,
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        files.update(result.stdout.strip().splitlines())
+    for diff_filter in ["--diff-filter=U", None]:
+        args = ["git", "diff", "--name-only"]
+        if diff_filter:
+            args.append(diff_filter)
+        result = _run_git(args, logger, cwd=worktree)
+        if result.returncode == 0 and result.stdout.strip():
+            files.update(result.stdout.strip().splitlines())
     return files
 
 
@@ -571,12 +477,7 @@ def apply_stack(
         return False, set()
 
     # Record HEAD so we can reset to it on failure
-    head_result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-    )
+    head_result = _run_git(["git", "rev-parse", "HEAD"], logger, cwd=worktree)
     if head_result.returncode != 0:
         logger.error("❌ Can't determine HEAD in %s", worktree)
         return False, set()
@@ -585,15 +486,8 @@ def apply_stack(
     logger.debug("📎 Applying %s", revision_str)
 
     result = subprocess.run(
-        [
-            "moz-phab", "patch",
-            "--apply-to", "here",
-            "--yes",
-            revision_str,
-        ],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
+        ["moz-phab", "patch", "--apply-to", "here", "--yes", revision_str],
+        cwd=worktree, capture_output=True, text=True,
     )
 
     if result.returncode != 0:
@@ -605,24 +499,18 @@ def apply_stack(
         if stack_file_map is not None:
             conflict_files = get_conflict_files(worktree, logger)
             diagnose_conflict(
-                conflict_files,
-                stack_file_map,
-                applied_files or {},
-                logger,
+                conflict_files, stack_file_map, applied_files or {}, logger,
             )
 
         # Reset to pre-patch state
-        subprocess.run(
-            ["git", "reset", "--hard", pre_patch_head],
-            cwd=worktree, check=False,
-        )
-        subprocess.run(["git", "clean", "-fd"], cwd=worktree, check=False)
+        _run_git(["git", "reset", "--hard", pre_patch_head], logger, cwd=worktree)
+        _run_git(["git", "clean", "-fd"], logger, cwd=worktree)
         return False, set()
 
     # Record which files this stack modified
-    diff_result = subprocess.run(
+    diff_result = _run_git(
         ["git", "diff", "--name-only", f"{pre_patch_head}..HEAD"],
-        cwd=worktree, capture_output=True, text=True,
+        logger, cwd=worktree,
     )
     modified_files: set[str] = set()
     if diff_result.returncode == 0 and diff_result.stdout.strip():
@@ -648,11 +536,7 @@ def parse_bug_file(bug_file: Path) -> tuple[str, str, str | None, str, list[str]
         # branch: main
         # tag: NSS_3_99_RTM
     """
-    repo_url: str | None = None
-    name: str | None = None
-    branch = DEFAULT_BRANCH
-    tag: str | None = None
-    branch_set = False
+    directives: dict[str, str] = {}
     bug_ids: list[str] = []
 
     for line in bug_file.read_text().splitlines():
@@ -661,26 +545,32 @@ def parse_bug_file(bug_file: Path) -> tuple[str, str, str | None, str, list[str]
             continue
         if stripped.startswith("#"):
             comment = stripped.lstrip("# ").strip()
-            if comment.lower().startswith("repo:"):
-                repo_url = comment.split(":", 1)[1].strip()
-            elif comment.lower().startswith("branch:"):
-                branch = comment.split(":", 1)[1].strip()
-                branch_set = True
-            elif comment.lower().startswith("tag:"):
-                tag = comment.split(":", 1)[1].strip()
-            elif comment.lower().startswith("name:"):
-                name = comment.split(":", 1)[1].strip()
+            key, _, value = comment.partition(":")
+            if key.lower() in {"repo", "branch", "tag", "name"} and value:
+                directives[key.lower()] = value.strip()
         else:
             bug_ids.append(stripped)
 
-    if tag and branch_set:
+    if "tag" in directives and "branch" in directives:
         raise ValueError("Bug file specifies both 'branch' and 'tag' — use one or the other")
-    if repo_url is None:
+    if "repo" not in directives:
         raise ValueError("Bug file must include a '# repo: <url>' directive")
-    if name is None:
-        name = bug_file.stem
 
-    return repo_url, branch, tag, name, bug_ids
+    return (
+        directives["repo"],
+        directives.get("branch", DEFAULT_BRANCH),
+        directives.get("tag"),
+        directives.get("name", bug_file.stem),
+        bug_ids,
+    )
+
+
+@dataclasses.dataclass
+class RunResult:
+    succeeded: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+    failed: list[tuple[str, int, str]] = dataclasses.field(default_factory=list)
+    skipped_bugs: list[str] = dataclasses.field(default_factory=list)
+    applied_files: dict[str, list[tuple[str, int]]] = dataclasses.field(default_factory=dict)
 
 
 def main() -> None:
@@ -715,36 +605,24 @@ def main() -> None:
     args = parser.parse_args()
 
     log_dir = args.out_dir / "logs"
-
     logger = setup_logging(log_dir, debug=args.debug)
 
     # Preflight checks
-    ok = True
-
-    if not shutil.which("moz-phab"):
-        logger.error("❌ moz-phab not found on PATH")
-        ok = False
-
-    if not shutil.which("git"):
-        logger.error("❌ git not found on PATH")
-        ok = False
-
     bz_api_key = os.environ.get("BUGZILLA_API_KEY")
-    if not bz_api_key:
-        logger.error("❌ BUGZILLA_API_KEY not set")
-        ok = False
-
     phab_api_token = os.environ.get("PHABRICATOR_API_TOKEN")
-    if not phab_api_token:
-        logger.error("❌ PHABRICATOR_API_TOKEN not set")
-        ok = False
-
     bug_file: Path = args.bug_file
-    if not bug_file.exists():
-        logger.error("❌ Bug file not found: %s", bug_file)
-        ok = False
 
-    if not ok:
+    checks = [
+        (shutil.which("moz-phab"), "moz-phab not found on PATH"),
+        (shutil.which("git"), "git not found on PATH"),
+        (bz_api_key, "BUGZILLA_API_KEY not set"),
+        (phab_api_token, "PHABRICATOR_API_TOKEN not set"),
+        (bug_file.exists(), f"Bug file not found: {bug_file}"),
+    ]
+    for val, msg in checks:
+        if not val:
+            logger.error("❌ %s", msg)
+    if not all(v for v, _ in checks):
         sys.exit(1)
 
     repo_url, branch, tag, name, bug_ids = parse_bug_file(bug_file)
@@ -765,32 +643,25 @@ def main() -> None:
     create_worktree(repo_dir, worktree_dir, branch, logger, tag=tag)
 
     # For each bug: find revisions, resolve stacks, check statuses, apply
-    succeeded: list[tuple[str, int]] = []
-    failed: list[tuple[str, int, str]] = []
-    skipped_bugs: list[str] = []
-    # Track which files have been modified by successfully-applied stacks,
-    # so we can identify the source of conflicts when a later patch fails.
-    applied_files: dict[str, list[tuple[str, int]]] = {}
-
-    pool = _ConnectionPool(
+    session = create_session(
         cache_db=None if args.no_cache else DEFAULT_CACHE_DB,
         cache_ttl=args.cache_ttl,
     )
     try:
-        _main_loop(bug_ids, bz_api_key, phab_api_token, pool, worktree_dir, logger,
-                   succeeded, failed, skipped_bugs, applied_files)
+        run = _main_loop(bug_ids, bz_api_key, phab_api_token, session,
+                         worktree_dir, logger)
     finally:
-        pool.close()
+        session.close()
 
     logger.info(
         "🗄️  Cache: %d hits / %d misses",
-        pool.cache_hits, pool.cache_misses,
+        session.cache_hits, session.cache_misses,
     )
 
     # Summary
     logger.info(
         "── %d applied · %d failed · %d no patches ──",
-        len(succeeded), len(failed), len(skipped_bugs),
+        len(run.succeeded), len(run.failed), len(run.skipped_bugs),
     )
     logger.info("📂 Worktree: %s", worktree_dir)
 
@@ -799,21 +670,19 @@ def _main_loop(
     bug_ids: list[str],
     bz_api_key: str,
     phab_api_token: str,
-    pool: _ConnectionPool,
+    session: requests.Session,
     worktree_dir: Path,
     logger: logging.Logger,
-    succeeded: list[tuple[str, int]],
-    failed: list[tuple[str, int, str]],
-    skipped_bugs: list[str],
-    applied_files: dict[str, list[tuple[str, int]]],
-) -> None:
+) -> RunResult:
+    run = RunResult()
+
     for bug_id in bug_ids:
         logger.debug("── Bug %s ──", bug_id)
 
         # Step 1: Get revision IDs from Bugzilla
-        rev_ids = get_revisions_for_bug(bug_id, bz_api_key, pool, logger)
+        rev_ids = get_revisions_for_bug(bug_id, bz_api_key, session, logger)
         if not rev_ids:
-            skipped_bugs.append(bug_id)
+            run.skipped_bugs.append(bug_id)
             logger.info("📭 Bug %s", bug_id)
             continue
 
@@ -829,10 +698,10 @@ def _main_loop(
         for rev_id in rev_ids:
             try:
                 tip_id, stack_revs = phab_find_stack_tip(
-                    rev_id, phab_api_token, pool, logger
+                    rev_id, phab_api_token, session, logger
                 )
             except RuntimeError as e:
-                failed.append((bug_id, rev_id, str(e)))
+                run.failed.append((bug_id, rev_id, str(e)))
                 rev_emojis[rev_id] = "❌"
                 tip_applied[rev_id] = False
                 bug_warnings.append(f"  D{rev_id}: {e}")
@@ -856,22 +725,22 @@ def _main_loop(
 
             # Fetch which files each revision in the stack touches
             stack_file_map = phab_get_revision_paths(
-                stack_revs, phab_api_token, pool, logger
+                stack_revs, phab_api_token, session, logger
             )
 
             # Step 3: Apply the stack via moz-phab
             ok, modified_files = apply_stack(
                 tip_id, worktree_dir, logger,
                 stack_file_map=stack_file_map,
-                applied_files=applied_files,
+                applied_files=run.applied_files,
             )
             tip_applied[tip_id] = ok
             if ok:
-                succeeded.append((bug_id, tip_id))
+                run.succeeded.append((bug_id, tip_id))
                 for f in modified_files:
-                    applied_files.setdefault(f, []).append((bug_id, tip_id))
+                    run.applied_files.setdefault(f, []).append((bug_id, tip_id))
             else:
-                failed.append((bug_id, tip_id, "patch failed"))
+                run.failed.append((bug_id, tip_id, "patch failed"))
                 bug_warnings.append(f"  D{tip_id}: patch failed to apply")
 
         # One-line per-bug summary
@@ -891,44 +760,25 @@ def _main_loop(
         for w in bug_warnings:
             logger.warning(w)
 
-
-class _ColorFormatter(logging.Formatter):
-    """Logging formatter that adds ANSI colour to the level name."""
-
-    COLORS = {
-        logging.DEBUG: "\033[36m",     # cyan
-        logging.INFO: "\033[32m",      # green
-        logging.WARNING: "\033[33m",   # yellow
-        logging.ERROR: "\033[31m",     # red
-        logging.CRITICAL: "\033[1;31m",  # bold red
-    }
-    RESET = "\033[0m"
-
-    def format(self, record: logging.LogRecord) -> str:
-        color = self.COLORS.get(record.levelno, "")
-        record.levelname = f"{color}{record.levelname}{self.RESET}"
-        return super().format(record)
+    return run
 
 
 def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
     logger = logging.getLogger("shadowtree")
     logger.setLevel(logging.DEBUG)
 
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.DEBUG if debug else logging.INFO)
-    if sys.stdout.isatty():
-        console.setFormatter(_ColorFormatter("%(asctime)s [%(levelname)s] %(message)s"))
-    else:
-        console.setFormatter(formatter)
+    console = RichHandler(
+        level=logging.DEBUG if debug else logging.INFO,
+        show_path=False,
+        markup=False,
+    )
     logger.addHandler(console)
 
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     fh = logging.FileHandler(log_dir / f"shadowtree_{timestamp}.log")
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(fh)
 
     return logger
