@@ -1,4 +1,13 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#     "requests>=2.33.1",
+#     "requests-cache>=1.3.1",
+#     "rich>=14.3.3",
+#     "unidiff>=0.7.5",
+# ]
+# ///
 """
 Clones a repo, looks up Phabricator revisions for each bug in Bugzilla,
 checks revision status via Phabricator Conduit, finds the stack tip,

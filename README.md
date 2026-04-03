@@ -4,7 +4,7 @@ Checks that private Phabricator patch stacks apply cleanly together against a fr
 
 ## Prerequisites
 
-- Python 3.10+
+- [uv](https://docs.astral.sh/uv/)
 - `moz-phab` on PATH
 - API keys: `BUGZILLA_API_KEY` and `PHABRICATOR_API_TOKEN`
 
@@ -13,7 +13,7 @@ Checks that private Phabricator patch stacks apply cleanly together against a fr
 ```
 export BUGZILLA_API_KEY=...
 export PHABRICATOR_API_TOKEN=...
-python shadowtree.py lists/bug-list.txt
+./shadowtree.py lists/bug-list.txt
 ```
 
 ## Bug lists
