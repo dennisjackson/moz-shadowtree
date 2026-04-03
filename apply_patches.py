@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Clones NSS, looks up Phabricator revisions for each bug in Bugzilla,
+Clones a repo, looks up Phabricator revisions for each bug in Bugzilla,
 checks revision status via Phabricator Conduit, finds the stack tip,
 creates a single worktree, and applies each stack via moz-phab patch.
 """
@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import ssl
 import subprocess
@@ -21,7 +22,8 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-NSS_REPO_URL = "https://github.com/nss-dev/nss.git"
+DEFAULT_REPO_URL = "https://github.com/nss-dev/nss.git"
+DEFAULT_BRANCH = "master"
 BUGZILLA_REST_URL = "https://bugzilla.mozilla.org/rest/bug"
 PHABRICATOR_API_URL = "https://phabricator.services.mozilla.com/api/"
 
@@ -131,7 +133,7 @@ class _ConnectionPool:
 
             if resp.status == 429:
                 delay = int(resp.getheader("Retry-After", "5"))
-                logging.getLogger("nss-patch-tool").warning(
+                logging.getLogger("patch-tool").warning(
                     "⏳ Rate-limited by %s, retrying in %ds", host, delay,
                 )
                 time.sleep(delay)
@@ -416,15 +418,20 @@ def _run_git(args: list[str], logger: logging.Logger, **kwargs) -> subprocess.Co
     return result
 
 
-def clone_nss(dest: Path, logger: logging.Logger) -> None:
+def clone_repo(dest: Path, repo_url: str, branch: str, logger: logging.Logger,
+               *, tag: str | None = None) -> None:
+    ref = tag or branch
     if (dest / ".git").exists():
-        logger.debug("📦 Updating NSS at %s", dest)
+        logger.debug("📦 Updating repo at %s", dest)
         _run_git(["git", "fetch", "origin"], logger, cwd=dest, check=True)
-        _run_git(["git", "checkout", "master"], logger, cwd=dest, check=True)
-        _run_git(["git", "reset", "--hard", "origin/master"], logger, cwd=dest, check=True)
+        if tag:
+            _run_git(["git", "checkout", tag], logger, cwd=dest, check=True)
+        else:
+            _run_git(["git", "checkout", branch], logger, cwd=dest, check=True)
+            _run_git(["git", "reset", "--hard", f"origin/{branch}"], logger, cwd=dest, check=True)
     else:
-        logger.debug("📦 Cloning NSS → %s", dest)
-        _run_git(["git", "clone", NSS_REPO_URL, str(dest)], logger, check=True)
+        logger.debug("📦 Cloning %s → %s", repo_url, dest)
+        _run_git(["git", "clone", repo_url, str(dest)], logger, check=True)
 
 
 def _cleanup_old_branches(repo: Path, logger: logging.Logger) -> None:
@@ -441,18 +448,23 @@ def _cleanup_old_branches(repo: Path, logger: logging.Logger) -> None:
         _run_git(["git", "branch", "-D", branch], logger, cwd=repo)
 
 
-def create_worktree(repo: Path, worktree: Path, logger: logging.Logger) -> None:
+def create_worktree(repo: Path, worktree: Path, branch: str, logger: logging.Logger,
+                    *, tag: str | None = None) -> None:
     branch_name = f"patch-apply-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    start_point = tag if tag else f"origin/{branch}"
     if worktree.exists():
         logger.debug("🌿 Removing old worktree %s", worktree)
-        _run_git(
+        result = _run_git(
             ["git", "worktree", "remove", "--force", str(worktree)],
             logger, cwd=repo,
         )
+        if result.returncode != 0 and worktree.exists():
+            logger.debug("🌿 git worktree remove failed; falling back to rmtree")
+            shutil.rmtree(worktree)
     _cleanup_old_branches(repo, logger)
-    logger.debug("🌿 Worktree %s [%s]", worktree, branch_name)
+    logger.debug("🌿 Worktree %s [%s] from %s", worktree, branch_name, start_point)
     _run_git(
-        ["git", "worktree", "add", "-b", branch_name, str(worktree), "origin/master"],
+        ["git", "worktree", "add", "-b", branch_name, str(worktree), start_point],
         logger, cwd=repo, check=True,
     )
 
@@ -628,18 +640,54 @@ def apply_stack(
 # Main
 # ---------------------------------------------------------------------------
 
+def parse_bug_file(bug_file: Path) -> tuple[str, str, str | None, list[str]]:
+    """Parse a bug list file, extracting optional repo/branch/tag directives.
+
+    Supports directives as comments:
+        # repo: https://github.com/nss-dev/nss.git
+        # branch: main
+        # tag: NSS_3_99_RTM
+    """
+    repo_url = DEFAULT_REPO_URL
+    branch = DEFAULT_BRANCH
+    tag: str | None = None
+    branch_set = False
+    bug_ids: list[str] = []
+
+    for line in bug_file.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            comment = stripped.lstrip("# ").strip()
+            if comment.lower().startswith("repo:"):
+                repo_url = comment.split(":", 1)[1].strip()
+            elif comment.lower().startswith("branch:"):
+                branch = comment.split(":", 1)[1].strip()
+                branch_set = True
+            elif comment.lower().startswith("tag:"):
+                tag = comment.split(":", 1)[1].strip()
+        else:
+            bug_ids.append(stripped)
+
+    if tag and branch_set:
+        raise ValueError("Bug file specifies both 'branch' and 'tag' — use one or the other")
+
+    return repo_url, branch, tag, bug_ids
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Apply NSS Phabricator patches by bug number.",
+        description="Apply Phabricator patches by bug number.",
     )
     parser.add_argument(
         "bug_file", type=Path, help="File with one bug number per line"
     )
     parser.add_argument(
-        "--nss-dir",
+        "--repo-dir",
         type=Path,
-        default=Path("nss"),
-        help="Directory to clone NSS into (default: ./nss)",
+        default=Path("repo"),
+        help="Directory to clone the repo into (default: ./repo)",
     )
     parser.add_argument(
         "--worktree-dir",
@@ -690,20 +738,20 @@ def main() -> None:
         logger.error("❌ Bug file not found: %s", bug_file)
         sys.exit(1)
 
-    bug_ids = [
-        line.strip()
-        for line in bug_file.read_text().splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    repo_url, branch, tag, bug_ids = parse_bug_file(bug_file)
     logger.info("📋 %d bug(s) from %s", len(bug_ids), bug_file)
+    if tag:
+        logger.info("🔗 Repo: %s  Tag: %s", repo_url, tag)
+    else:
+        logger.info("🔗 Repo: %s  Branch: %s", repo_url, branch)
 
-    # Clone / update NSS
-    nss_dir = args.nss_dir.resolve()
-    clone_nss(nss_dir, logger)
+    # Clone / update repo
+    repo_dir = args.repo_dir.resolve()
+    clone_repo(repo_dir, repo_url, branch, logger, tag=tag)
 
     # Create a single worktree
     worktree_dir = args.worktree_dir.resolve()
-    create_worktree(nss_dir, worktree_dir, logger)
+    create_worktree(repo_dir, worktree_dir, branch, logger, tag=tag)
 
     # For each bug: find revisions, resolve stacks, check statuses, apply
     succeeded: list[tuple[str, int]] = []
@@ -852,7 +900,7 @@ class _ColorFormatter(logging.Formatter):
 
 
 def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
-    logger = logging.getLogger("nss-patch-tool")
+    logger = logging.getLogger("patch-tool")
     logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
