@@ -220,7 +220,16 @@ def _main_loop(
             if emoji != "\u2705":
                 all_good = False
             parts.append(f"D{rev_id}{emoji}")
-        bug_emoji = "\u2705" if all_good else "\u26a0\ufe0f "
+        has_failed = any(e == "\u274c" for e in rev_emojis.values()) or any(
+            rev_id in tip_applied and not tip_applied[rev_id] for rev_id in rev_emojis
+        )
+        has_unreviewed = any(e == "\u23f3" for e in rev_emojis.values())
+        if has_failed:
+            bug_emoji = "\u274c"
+        elif has_unreviewed:
+            bug_emoji = "\u23f3"
+        else:
+            bug_emoji = "\u2705"
         logger.info("%s Bug %s  %s", bug_emoji, bug_id, " ".join(parts))
 
         for w in bug_warnings:

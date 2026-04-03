@@ -47,10 +47,11 @@ def clone_repo(dest: Path, repo_url: str, branch: str, logger: logging.Logger,
 
 
 def _cleanup_old_branches(repo: Path, logger: logging.Logger) -> None:
-    for branch in _git_lines(["git", "branch", "--list", "patch-apply-*"], logger, cwd=repo):
-        branch = branch.strip().lstrip("* ")
-        logger.debug("\U0001f9f9 Deleting old branch %s", branch)
-        _run_git(["git", "branch", "-D", branch], logger, cwd=repo)
+    for pattern in ("patch-apply-*", "phab-*"):
+        for branch in _git_lines(["git", "branch", "--list", pattern], logger, cwd=repo):
+            branch = branch.strip().lstrip("* ")
+            logger.debug("\U0001f9f9 Deleting old branch %s", branch)
+            _run_git(["git", "branch", "-D", branch], logger, cwd=repo)
 
 
 def create_worktree(repo: Path, worktree: Path, branch: str, logger: logging.Logger,
@@ -149,7 +150,7 @@ def apply_stack(
     logger.debug("\U0001f4ce Applying %s", revision_str)
 
     result = subprocess.run(
-        ["moz-phab", "patch", "--apply-to", "here", "--yes", revision_str],
+        ["moz-phab", "patch", "--apply-to", "here", "--yes", "--trace", revision_str],
         cwd=worktree, capture_output=True, text=True,
     )
 

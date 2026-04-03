@@ -27,7 +27,7 @@ STATUS_EMOJI = {
     "accepted": "\u2705",
     "needs-review": "\u23f3",
     "changes-planned": "\u23f3",
-    "needs-revision": "\u26a0\ufe0f ",
+    "needs-revision": "\u23f3",
     "abandoned": "\U0001f5d1\ufe0f",
 }
 
