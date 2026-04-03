@@ -6,15 +6,15 @@ creates a single worktree, and applies each stack via moz-phab patch.
 """
 
 import argparse
+import http.client
 import json
 import logging
 import os
 import re
+import ssl
 import subprocess
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -29,10 +29,66 @@ SKIP_STATUSES = {"abandoned"}
 
 
 # ---------------------------------------------------------------------------
+# Persistent HTTP connection pool (stdlib only)
+# ---------------------------------------------------------------------------
+
+class _ConnectionPool:
+    """Reuses HTTP(S) connections per (host, port) pair."""
+
+    def __init__(self, timeout: int = 30):
+        self._timeout = timeout
+        self._conns: dict[tuple[str, int], http.client.HTTPSConnection] = {}
+
+    def urlopen(self, url: str, data: bytes | None = None,
+                headers: dict[str, str] | None = None,
+                method: str = "POST") -> bytes:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or 443
+        key = (host, port)
+
+        conn = self._conns.get(key)
+        if conn is None:
+            ctx = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
+                                               context=ctx)
+            self._conns[key] = conn
+
+        path = parsed.path
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        hdrs = headers or {}
+        try:
+            conn.request(method, path, body=data, headers=hdrs)
+            resp = conn.getresponse()
+        except (http.client.RemoteDisconnected, ConnectionError, OSError):
+            # Server closed the keep-alive connection; reconnect once.
+            ctx = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
+                                               context=ctx)
+            self._conns[key] = conn
+            conn.request(method, path, body=data, headers=hdrs)
+            resp = conn.getresponse()
+
+        body = resp.read()
+        if resp.status >= 400:
+            raise http.client.HTTPException(
+                f"HTTP {resp.status} {resp.reason} for {url}"
+            )
+        return body
+
+    def close(self) -> None:
+        for conn in self._conns.values():
+            conn.close()
+        self._conns.clear()
+
+
+# ---------------------------------------------------------------------------
 # Phabricator Conduit helpers
 # ---------------------------------------------------------------------------
 
-def phab_call(method: str, args: dict, api_token: str) -> dict:
+def phab_call(method: str, args: dict, api_token: str, pool: _ConnectionPool) -> dict:
     """Call a Phabricator Conduit API method and return the result."""
     url = urllib.parse.urljoin(PHABRICATOR_API_URL, method)
     payload = urllib.parse.urlencode({
@@ -44,9 +100,10 @@ def phab_call(method: str, args: dict, api_token: str) -> dict:
         "__conduit__": True,
     }).encode()
 
-    req = urllib.request.Request(url, data=payload, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
+    body = pool.urlopen(url, data=payload, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+    })
+    data = json.loads(body)
 
     if data.get("error_code"):
         raise RuntimeError(
@@ -55,17 +112,17 @@ def phab_call(method: str, args: dict, api_token: str) -> dict:
     return data["result"]
 
 
-def phab_get_revisions(rev_ids: list[int], api_token: str) -> list[dict]:
+def phab_get_revisions(rev_ids: list[int], api_token: str, pool: _ConnectionPool) -> list[dict]:
     """Fetch revision metadata (including status) for a list of integer IDs."""
     result = phab_call("differential.revision.search", {
         "constraints": {"ids": rev_ids},
         "attachments": {"reviewers": True},
-    }, api_token)
+    }, api_token, pool)
     return result.get("data", [])
 
 
 def _walk_stack_edges(
-    phid: str, edge_type: str, api_token: str, logger: logging.Logger
+    phid: str, edge_type: str, api_token: str, pool: _ConnectionPool, logger: logging.Logger
 ) -> list[str]:
     """Walk a single-direction edge chain (parent or child) from *phid*.
 
@@ -78,7 +135,7 @@ def _walk_stack_edges(
         edges = phab_call("edge.search", {
             "sourcePHIDs": [current],
             "types": [edge_type],
-        }, api_token)
+        }, api_token, pool)
         edge_data = edges.get("data", [])
         if not edge_data:
             break
@@ -94,13 +151,13 @@ def _walk_stack_edges(
     return result
 
 
-def phab_find_stack_tip(rev_id: int, api_token: str, logger: logging.Logger) -> tuple[int, list[dict]]:
+def phab_find_stack_tip(rev_id: int, api_token: str, pool: _ConnectionPool, logger: logging.Logger) -> tuple[int, list[dict]]:
     """Given a revision ID, walk to the top *and* bottom of its stack.
 
     Returns (tip_rev_id, all_revisions_in_stack) where all_revisions_in_stack
     is ordered bottom-to-top (base first, tip last).
     """
-    revs = phab_get_revisions([rev_id], api_token)
+    revs = phab_get_revisions([rev_id], api_token, pool)
     if not revs:
         raise RuntimeError(f"Revision D{rev_id} not found on Phabricator")
 
@@ -108,11 +165,11 @@ def phab_find_stack_tip(rev_id: int, api_token: str, logger: logging.Logger) -> 
 
     # Walk down to the stack base (parents)
     parent_phids = _walk_stack_edges(
-        base_rev["phid"], "revision.parent", api_token, logger
+        base_rev["phid"], "revision.parent", api_token, pool, logger
     )
     # Walk up to the stack tip (children)
     children_phids = _walk_stack_edges(
-        base_rev["phid"], "revision.child", api_token, logger
+        base_rev["phid"], "revision.child", api_token, pool, logger
     )
 
     # Fetch full revision data for all related PHIDs
@@ -121,7 +178,7 @@ def phab_find_stack_tip(rev_id: int, api_token: str, logger: logging.Logger) -> 
         related_revs = phab_call("differential.revision.search", {
             "constraints": {"phids": related_phids},
             "attachments": {"reviewers": True},
-        }, api_token).get("data", [])
+        }, api_token, pool).get("data", [])
         related_map = {r["phid"]: r for r in related_revs}
     else:
         related_map = {}
@@ -142,22 +199,31 @@ def phab_find_stack_tip(rev_id: int, api_token: str, logger: logging.Logger) -> 
     return tip_id, all_revs
 
 
-def check_revision_statuses(
-    revisions: list[dict], bug_id: str, logger: logging.Logger
-) -> None:
-    """Log warnings for any revisions that are not approved."""
+def get_revision_status_emojis(
+    revisions: list[dict], logger: logging.Logger
+) -> dict[int, str]:
+    """Return a mapping of revision ID to a status emoji.
+
+    ✅ = accepted, ⏳ = needs-review/changes-planned, ⚠️ = needs-revision, 🗑️ = abandoned.
+    """
+    STATUS_EMOJI = {
+        "accepted": "✅",
+        "needs-review": "⏳",
+        "changes-planned": "⏳",
+        "needs-revision": "⚠️ ",
+        "abandoned": "🗑️",
+    }
+    result: dict[int, str] = {}
     for rev in revisions:
         status = rev["fields"]["status"]["value"]
-        status_name = rev["fields"]["status"].get("name", status)
         rev_id = rev["id"]
-        if status not in APPROVED_STATUSES:
-            logger.warning("⚠️  D%d [%s] (not approved)", rev_id, status_name)
-        else:
-            logger.debug("✅ D%d [%s]", rev_id, status_name)
+        result[rev_id] = STATUS_EMOJI.get(status, "❓")
+        logger.debug("D%d [%s] → %s", rev_id, status, result[rev_id])
+    return result
 
 
 def phab_get_revision_paths(
-    revisions: list[dict], api_token: str, logger: logging.Logger
+    revisions: list[dict], api_token: str, pool: _ConnectionPool, logger: logging.Logger
 ) -> dict[int, set[str]]:
     """Fetch the file paths touched by each revision via Phabricator.
 
@@ -174,7 +240,7 @@ def phab_get_revision_paths(
         "constraints": {"revisionPHIDs": rev_phids},
         "order": "newest",
         "limit": len(rev_phids) * 5,
-    }, api_token)
+    }, api_token, pool)
 
     rev_phid_to_diff_id: dict[str, int] = {}
     for diff in diffs_result.get("data", []):
@@ -190,7 +256,7 @@ def phab_get_revision_paths(
         try:
             raw = phab_call("differential.getrawdiff", {
                 "diffID": diff_id,
-            }, api_token)
+            }, api_token, pool)
             paths = set()
             if isinstance(raw, str):
                 for line in raw.splitlines():
@@ -211,7 +277,7 @@ def phab_get_revision_paths(
 # ---------------------------------------------------------------------------
 
 def get_revisions_for_bug(
-    bug_id: str, bz_api_key: str, logger: logging.Logger
+    bug_id: str, bz_api_key: str, pool: _ConnectionPool, logger: logging.Logger
 ) -> list[int]:
     """Query Bugzilla for Phabricator revision attachments on a bug.
 
@@ -220,18 +286,14 @@ def get_revisions_for_bug(
     url = f"{BUGZILLA_REST_URL}/{bug_id}/attachment"
     logger.debug("🔍 Bug %s attachments", bug_id)
 
-    req = urllib.request.Request(url)
-    req.add_header("Accept", "application/json")
-    req.add_header("X-BUGZILLA-API-KEY", bz_api_key)
-
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        logger.error("❌ Bug %s: HTTP %s", bug_id, e.code)
-        return []
-    except urllib.error.URLError as e:
-        logger.error("❌ Bug %s: %s", bug_id, e.reason)
+        raw = pool.urlopen(url, method="GET", headers={
+            "Accept": "application/json",
+            "X-BUGZILLA-API-KEY": bz_api_key,
+        })
+        data = json.loads(raw)
+    except (http.client.HTTPException, ConnectionError, OSError) as e:
+        logger.error("❌ Bug %s: %s", bug_id, e)
         return []
 
     rev_ids: list[int] = []
@@ -256,7 +318,7 @@ def get_revisions_for_bug(
     if rev_ids:
         logger.debug("🐛 Bug %s → %s", bug_id, ", ".join(f"D{r}" for r in rev_ids))
     else:
-        logger.warning("⚠️  Bug %s: no revisions found", bug_id)
+        logger.debug("Bug %s: no revisions found", bug_id)
 
     return rev_ids
 
@@ -556,31 +618,62 @@ def main() -> None:
     # so we can identify the source of conflicts when a later patch fails.
     applied_files: dict[str, list[tuple[str, int]]] = {}
 
+    pool = _ConnectionPool()
+    try:
+        _main_loop(bug_ids, bz_api_key, phab_api_token, pool, worktree_dir, logger,
+                   succeeded, failed, skipped_bugs, applied_files)
+    finally:
+        pool.close()
+
+    # Summary
+    logger.info(
+        "── %d applied · %d failed · %d no patches ──",
+        len(succeeded), len(failed), len(skipped_bugs),
+    )
+    logger.info("📂 Worktree: %s", worktree_dir)
+
+
+def _main_loop(
+    bug_ids: list[str],
+    bz_api_key: str,
+    phab_api_token: str,
+    pool: _ConnectionPool,
+    worktree_dir: Path,
+    logger: logging.Logger,
+    succeeded: list[tuple[str, int]],
+    failed: list[tuple[str, int, str]],
+    skipped_bugs: list[str],
+    applied_files: dict[str, list[tuple[str, int]]],
+) -> None:
     for bug_id in bug_ids:
-        logger.debug("── 🐛 Bug %s ──", bug_id)
+        logger.debug("── Bug %s ──", bug_id)
 
         # Step 1: Get revision IDs from Bugzilla
-        rev_ids = get_revisions_for_bug(bug_id, bz_api_key, logger)
+        rev_ids = get_revisions_for_bug(bug_id, bz_api_key, pool, logger)
         if not rev_ids:
             skipped_bugs.append(bug_id)
-            logger.info("⏭️  Bug %s: no revisions", bug_id)
+            logger.info("📭 Bug %s", bug_id)
             continue
 
         # Step 2: For each revision, find the stack tip and check statuses
         # Deduplicate tips — multiple revisions on one bug may share a stack
         tips_seen: set[int] = set()
-        bug_ok: list[int] = []
-        bug_fail: list[int] = []
+        # Per-revision status emoji and per-tip apply result
+        rev_emojis: dict[int, str] = {}
+        tip_applied: dict[int, bool] = {}
+        # Warnings to print after the summary line (only for real failures)
+        bug_warnings: list[str] = []
 
         for rev_id in rev_ids:
             try:
                 tip_id, stack_revs = phab_find_stack_tip(
-                    rev_id, phab_api_token, logger
+                    rev_id, phab_api_token, pool, logger
                 )
             except RuntimeError as e:
-                logger.error("❌ Bug %s D%d: %s", bug_id, rev_id, e)
                 failed.append((bug_id, rev_id, str(e)))
-                bug_fail.append(rev_id)
+                rev_emojis[rev_id] = "❌"
+                tip_applied[rev_id] = False
+                bug_warnings.append(f"  D{rev_id}: {e}")
                 continue
 
             # Skip if the entry revision itself is abandoned
@@ -588,12 +681,11 @@ def main() -> None:
                 (r for r in stack_revs if r["id"] == rev_id), None
             )
             if entry_rev and entry_rev["fields"]["status"]["value"] in SKIP_STATUSES:
-                status_name = entry_rev["fields"]["status"].get("name", "abandoned")
-                logger.debug("🗑️  D%d [%s], skipping", rev_id, status_name)
+                logger.debug("🗑️  D%d abandoned, skipping", rev_id)
                 continue
 
-            # Check and warn about non-approved revisions in the stack
-            check_revision_statuses(stack_revs, bug_id, logger)
+            # Collect per-revision status emojis
+            rev_emojis.update(get_revision_status_emojis(stack_revs, logger))
 
             if tip_id in tips_seen:
                 logger.debug("⏭️  D%d (tip D%d already queued)", rev_id, tip_id)
@@ -602,7 +694,7 @@ def main() -> None:
 
             # Fetch which files each revision in the stack touches
             stack_file_map = phab_get_revision_paths(
-                stack_revs, phab_api_token, logger
+                stack_revs, phab_api_token, pool, logger
             )
 
             # Step 3: Apply the stack via moz-phab
@@ -611,37 +703,31 @@ def main() -> None:
                 stack_file_map=stack_file_map,
                 applied_files=applied_files,
             )
+            tip_applied[tip_id] = ok
             if ok:
                 succeeded.append((bug_id, tip_id))
-                bug_ok.append(tip_id)
                 for f in modified_files:
                     applied_files.setdefault(f, []).append((bug_id, tip_id))
             else:
-                failed.append((bug_id, tip_id, "moz-phab patch failed"))
-                bug_fail.append(tip_id)
+                failed.append((bug_id, tip_id, "patch failed"))
+                bug_warnings.append(f"  D{tip_id}: patch failed to apply")
 
         # One-line per-bug summary
+        # Each revision gets its status emoji; failed applies override with ❌
         parts: list[str] = []
-        if bug_ok:
-            parts.append("✅ " + ", ".join(f"D{t}" for t in bug_ok))
-        if bug_fail:
-            parts.append("❌ " + ", ".join(f"D{t}" for t in bug_fail))
-        logger.info("🐛 Bug %s  %s", bug_id, "  ".join(parts))
+        all_good = True
+        for rev_id, emoji in rev_emojis.items():
+            if rev_id in tip_applied and not tip_applied[rev_id]:
+                emoji = "❌"
+            if emoji != "✅":
+                all_good = False
+            parts.append(f"D{rev_id}{emoji}")
+        bug_emoji = "✅" if all_good else "⚠️ "
+        logger.info("%s Bug %s  %s", bug_emoji, bug_id, " ".join(parts))
 
-    # Summary
-    logger.info("═" * 50)
-    logger.info(
-        "📊 ✅ %d applied · ❌ %d failed · ⏭️  %d skipped",
-        len(succeeded), len(failed), len(skipped_bugs),
-    )
-    for bug_id, tip_id in succeeded:
-        logger.info("   ✅ Bug %s → D%d", bug_id, tip_id)
-    for bug_id, rev_id, reason in failed:
-        logger.info("   ❌ Bug %s → D%d: %s", bug_id, rev_id, reason)
-    if skipped_bugs:
-        logger.info("   ⏭️  No revisions: %s", ", ".join(skipped_bugs))
-    logger.info("📂 Worktree: %s", worktree_dir)
-    logger.info("═" * 50)
+        # Print warnings for actual failures only
+        for w in bug_warnings:
+            logger.warning(w)
 
 
 class _ColorFormatter(logging.Formatter):
