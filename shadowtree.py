@@ -47,6 +47,9 @@ class RunResult:
     failed: list[tuple[str, int, str]] = dataclasses.field(default_factory=list)
     skipped_bugs: list[str] = dataclasses.field(default_factory=list)
     applied_files: dict[str, list[tuple[str, int]]] = dataclasses.field(default_factory=dict)
+    rev_accepted: int = 0
+    rev_failed: int = 0
+    rev_unreviewed: int = 0
 
 
 def main() -> None:
@@ -133,8 +136,8 @@ def main() -> None:
     )
 
     logger.info(
-        "\u2500\u2500 %d applied \u00b7 %d failed \u00b7 %d no patches \u2500\u2500",
-        len(run.succeeded), len(run.failed), len(run.skipped_bugs),
+        "\u2500\u2500 \u2705 %d applied \u00b7 \u274c %d failed \u00b7 \u23f3 %d unreviewed \u00b7 \U0001f4ed %d no patches \u2500\u2500",
+        run.rev_accepted, run.rev_failed, run.rev_unreviewed, len(run.skipped_bugs),
     )
     logger.info("\U0001f4c2 Worktree: %s", worktree_dir)
 
@@ -208,6 +211,12 @@ def _main_loop(
         for rev_id, emoji in rev_emojis.items():
             if rev_id in tip_applied and not tip_applied[rev_id]:
                 emoji = "\u274c"
+            if emoji == "\u2705":
+                run.rev_accepted += 1
+            elif emoji == "\u274c":
+                run.rev_failed += 1
+            elif emoji == "\u23f3":
+                run.rev_unreviewed += 1
             if emoji != "\u2705":
                 all_good = False
             parts.append(f"D{rev_id}{emoji}")
