@@ -245,7 +245,9 @@ def setup_logging(log_dir: Path, *, debug: bool = False) -> logging.Logger:
     console = RichHandler(
         level=logging.DEBUG if debug else logging.INFO,
         show_path=False,
+        show_level=False,
         markup=False,
+        log_time_format="%H:%M:%S",
     )
     logger.addHandler(console)
 
